@@ -15,7 +15,6 @@ import (
 	"testing"
 
 	"github.com/syncthing/syncthing/lib/config"
-	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rc"
 )
@@ -27,13 +26,16 @@ func TestSymlinks(t *testing.T) {
 
 	// Use no versioning
 	id, _ := protocol.DeviceIDFromString(id2)
-	cfg, _, _ := config.Load("h2/config.xml", id, events.NoopLogger)
-	fld := cfg.Folders()["default"]
+	cfg := loadConfigCopy(t, "h2/config.xml", id)
+	fld, _, ok := cfg.Folder("default")
+	if !ok {
+		t.Fatal("missing default folder")
+	}
 	fld.Versioning = config.VersioningConfiguration{}
 	cfg.SetFolder(fld)
 	os.Rename("h2/config.xml", "h2/config.xml.orig")
 	defer os.Rename("h2/config.xml.orig", "h2/config.xml")
-	cfg.Save()
+	writeConfigXML(t, "h2/config.xml", cfg)
 
 	testSymlinks(t)
 }
@@ -45,8 +47,11 @@ func TestSymlinksSimpleVersioning(t *testing.T) {
 
 	// Use simple versioning
 	id, _ := protocol.DeviceIDFromString(id2)
-	cfg, _, _ := config.Load("h2/config.xml", id, events.NoopLogger)
-	fld := cfg.Folders()["default"]
+	cfg := loadConfigCopy(t, "h2/config.xml", id)
+	fld, _, ok := cfg.Folder("default")
+	if !ok {
+		t.Fatal("missing default folder")
+	}
 	fld.Versioning = config.VersioningConfiguration{
 		Type:   "simple",
 		Params: map[string]string{"keep": "5"},
@@ -54,7 +59,7 @@ func TestSymlinksSimpleVersioning(t *testing.T) {
 	cfg.SetFolder(fld)
 	os.Rename("h2/config.xml", "h2/config.xml.orig")
 	defer os.Rename("h2/config.xml.orig", "h2/config.xml")
-	cfg.Save()
+	writeConfigXML(t, "h2/config.xml", cfg)
 
 	testSymlinks(t)
 }
@@ -66,15 +71,18 @@ func TestSymlinksStaggeredVersioning(t *testing.T) {
 
 	// Use staggered versioning
 	id, _ := protocol.DeviceIDFromString(id2)
-	cfg, _, _ := config.Load("h2/config.xml", id, events.NoopLogger)
-	fld := cfg.Folders()["default"]
+	cfg := loadConfigCopy(t, "h2/config.xml", id)
+	fld, _, ok := cfg.Folder("default")
+	if !ok {
+		t.Fatal("missing default folder")
+	}
 	fld.Versioning = config.VersioningConfiguration{
 		Type: "staggered",
 	}
 	cfg.SetFolder(fld)
 	os.Rename("h2/config.xml", "h2/config.xml.orig")
 	defer os.Rename("h2/config.xml.orig", "h2/config.xml")
-	cfg.Save()
+	writeConfigXML(t, "h2/config.xml", cfg)
 
 	testSymlinks(t)
 }

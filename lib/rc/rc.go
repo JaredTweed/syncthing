@@ -163,6 +163,19 @@ func (p *Process) Stopped() chan struct{} {
 // Get performs an HTTP GET and returns the bytes and/or an error. Any non-200
 // return code is returned as an error.
 func (p *Process) Get(path string) ([]byte, error) {
+	bs, status, err := p.GetWithStatus(path)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return bs, errors.New(http.StatusText(status))
+	}
+	return bs, nil
+}
+
+// GetWithStatus performs an HTTP GET and returns the bytes, status code, and
+// transport error if any.
+func (p *Process) GetWithStatus(path string) ([]byte, int, error) {
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
@@ -175,22 +188,35 @@ func (p *Process) Get(path string) ([]byte, error) {
 	url := fmt.Sprintf("http://%s%s", p.addr, path)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	req.Header.Add("X-Api-Key", APIKey)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	return p.readResponse(resp)
+	return p.readResponseWithStatus(resp)
 }
 
 // Post performs an HTTP POST and returns the bytes and/or an error. Any
 // non-200 return code is returned as an error.
 func (p *Process) Post(path string, data io.Reader) ([]byte, error) {
+	bs, status, err := p.PostWithStatus(path, data)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return bs, errors.New(http.StatusText(status))
+	}
+	return bs, nil
+}
+
+// PostWithStatus performs an HTTP POST and returns the bytes, status code, and
+// transport error if any.
+func (p *Process) PostWithStatus(path string, data io.Reader) ([]byte, int, error) {
 	client := &http.Client{
 		Timeout: 600 * time.Second,
 		Transport: &http.Transport{
@@ -200,7 +226,7 @@ func (p *Process) Post(path string, data io.Reader) ([]byte, error) {
 	url := fmt.Sprintf("http://%s%s", p.addr, path)
 	req, err := http.NewRequest(http.MethodPost, url, data)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	req.Header.Add("X-Api-Key", APIKey)
@@ -208,10 +234,10 @@ func (p *Process) Post(path string, data io.Reader) ([]byte, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	return p.readResponse(resp)
+	return p.readResponseWithStatus(resp)
 }
 
 type Event struct {
@@ -392,15 +418,23 @@ func (p *Process) Model(folder string) (Model, error) {
 }
 
 func (*Process) readResponse(resp *http.Response) ([]byte, error) {
-	bs, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	bs, status, err := (*Process)(nil).readResponseWithStatus(resp)
 	if err != nil {
 		return bs, err
 	}
-	if resp.StatusCode != http.StatusOK {
+	if status != http.StatusOK {
 		return bs, errors.New(resp.Status)
 	}
 	return bs, nil
+}
+
+func (*Process) readResponseWithStatus(resp *http.Response) ([]byte, int, error) {
+	bs, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return bs, resp.StatusCode, err
+	}
+	return bs, resp.StatusCode, nil
 }
 
 func (p *Process) checkForProblems(logfd *os.File) error {
@@ -607,12 +641,26 @@ func (p *Process) Connections() (map[string]ConnectionStats, error) {
 		return nil, err
 	}
 
-	var res map[string]ConnectionStats
-	if err := json.Unmarshal(bs, &res); err != nil {
+	var payload struct {
+		Connections map[string]ConnectionStats `json:"connections"`
+		Total       struct {
+			At            time.Time `json:"at"`
+			InBytesTotal  int64     `json:"inBytesTotal"`
+			OutBytesTotal int64     `json:"outBytesTotal"`
+		} `json:"total"`
+	}
+	if err := json.Unmarshal(bs, &payload); err != nil {
 		return nil, err
 	}
 
-	return res, nil
+	if payload.Connections == nil {
+		payload.Connections = make(map[string]ConnectionStats)
+	}
+	payload.Connections["total"] = ConnectionStats{
+		InBytesTotal:  payload.Total.InBytesTotal,
+		OutBytesTotal: payload.Total.OutBytesTotal,
+	}
+	return payload.Connections, nil
 }
 
 type SystemStatus struct {
@@ -669,10 +717,64 @@ func (p *Process) RemoteInSync(folder string, dev protocol.DeviceID) (bool, erro
 		return false, err
 	}
 
-	var comp model.FolderCompletion
+	var comp struct {
+		NeedItems   int `json:"needItems"`
+		NeedDeletes int `json:"needDeletes"`
+	}
 	if err := json.Unmarshal(bs, &comp); err != nil {
 		return false, err
 	}
 
 	return comp.NeedItems+comp.NeedDeletes == 0, nil
+}
+
+func (p *Process) VirtualFilePresence(folder, file string) (model.FilePresence, int, error) {
+	path := fmt.Sprintf("/rest/debug/virtual-file?folder=%s&file=%s", url.QueryEscape(folder), url.QueryEscape(file))
+	bs, status, err := p.GetWithStatus(path)
+	if err != nil {
+		return model.FilePresence{}, status, err
+	}
+	if status != http.StatusOK {
+		return model.FilePresence{}, status, nil
+	}
+
+	var presence model.FilePresence
+	if err := json.Unmarshal(bs, &presence); err != nil {
+		return model.FilePresence{}, status, err
+	}
+	return presence, status, nil
+}
+
+func (p *Process) SetMetadataOnly(folder, file string) (model.FilePresence, int, error) {
+	path := fmt.Sprintf("/rest/debug/virtual-file/metadata-only?folder=%s&file=%s", url.QueryEscape(folder), url.QueryEscape(file))
+	bs, status, err := p.PostWithStatus(path, nil)
+	if err != nil {
+		return model.FilePresence{}, status, err
+	}
+	if status != http.StatusOK {
+		return model.FilePresence{}, status, nil
+	}
+
+	var presence model.FilePresence
+	if err := json.Unmarshal(bs, &presence); err != nil {
+		return model.FilePresence{}, status, err
+	}
+	return presence, status, nil
+}
+
+func (p *Process) FetchVirtualFile(folder, file string) (model.FilePresence, int, error) {
+	path := fmt.Sprintf("/rest/debug/virtual-file/fetch?folder=%s&file=%s", url.QueryEscape(folder), url.QueryEscape(file))
+	bs, status, err := p.PostWithStatus(path, nil)
+	if err != nil {
+		return model.FilePresence{}, status, err
+	}
+	if status != http.StatusOK {
+		return model.FilePresence{}, status, nil
+	}
+
+	var presence model.FilePresence
+	if err := json.Unmarshal(bs, &presence); err != nil {
+		return model.FilePresence{}, status, err
+	}
+	return presence, status, nil
 }

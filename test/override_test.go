@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/syncthing/syncthing/lib/config"
-	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rc"
 )
@@ -26,13 +25,16 @@ import (
 func TestOverride(t *testing.T) {
 	// Enable "send-only" on s1/default
 	id, _ := protocol.DeviceIDFromString(id1)
-	cfg, _, _ := config.Load("h1/config.xml", id, events.NoopLogger)
-	fld := cfg.Folders()["default"]
+	cfg := loadConfigCopy(t, "h1/config.xml", id)
+	fld, _, ok := cfg.Folder("default")
+	if !ok {
+		t.Fatal("missing default folder")
+	}
 	fld.Type = config.FolderTypeSendOnly
 	cfg.SetFolder(fld)
 	os.Rename("h1/config.xml", "h1/config.xml.orig")
 	defer os.Rename("h1/config.xml.orig", "h1/config.xml")
-	cfg.Save()
+	writeConfigXML(t, "h1/config.xml", cfg)
 
 	log.Println("Cleaning...")
 	err := removeAll("s1", "s2", "h1/index*", "h2/index*")
