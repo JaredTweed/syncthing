@@ -34,6 +34,7 @@ const virtualFilesPresenceKVPrefix = "virtualfiles/presence"
 var (
 	ErrExperimentalVirtualFilesDisabled = errors.New("experimentalVirtualFiles is disabled")
 	ErrVirtualFileAlreadyLocal          = errors.New("file already exists locally")
+	ErrVirtualFileIgnored               = errors.New("file is ignored locally")
 	ErrVirtualFileNotSupported          = errors.New("metadata-only placeholders are only supported for regular files")
 )
 
@@ -144,7 +145,14 @@ func newFilePresence(folder, file string, state PresenceState, backend ContentBa
 }
 
 func normalizeVirtualFilePath(file string) (string, error) {
-	return fs.Canonicalize(file)
+	name, err := fs.Canonicalize(file)
+	if err != nil {
+		return "", err
+	}
+	if name == "." || name == "" {
+		return "", protocol.ErrInvalid
+	}
+	return name, nil
 }
 
 func virtualFileRecordPrefix(folder string) string {
@@ -168,8 +176,8 @@ func (m *model) virtualFileRecord(folder, file string) (virtualFileRecord, bool,
 	return record, true, nil
 }
 
-func (m *model) metadataOnlyNames(folder string) (map[string]struct{}, error) {
-	names := make(map[string]struct{})
+func (m *model) virtualFileRecordNames(folder string) ([]string, error) {
+	names := make([]string, 0)
 	prefix := virtualFileRecordPrefix(folder) + "/"
 
 	it, errFn := m.sdb.PrefixKV(prefix)
@@ -178,16 +186,50 @@ func (m *model) metadataOnlyNames(folder string) (map[string]struct{}, error) {
 		if file == "" {
 			continue
 		}
+		names = append(names, file)
+	}
+	return names, errFn()
+}
 
-		var record virtualFileRecord
-		if err := json.Unmarshal(kv.Value, &record); err != nil {
-			continue
+func (m *model) virtualFileIgnored(folder, file string) bool {
+	m.mut.RLock()
+	ignores := m.folderIgnores[folder]
+	m.mut.RUnlock()
+	return ignores != nil && ignores.Match(file).IsIgnored()
+}
+
+func virtualFileExistsLocally(filesystem fs.Filesystem, file string) (bool, error) {
+	_, err := filesystem.Lstat(file)
+	switch {
+	case err == nil, fs.IsErrCaseConflict(err):
+		return true, nil
+	case fs.IsNotExist(err):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+func virtualFileMutexKey(folder, file string) string {
+	return folder + "\x00" + file
+}
+
+func (m *model) metadataOnlyNames(folder string) (map[string]struct{}, error) {
+	names := make(map[string]struct{})
+	candidates, err := m.virtualFileRecordNames(folder)
+	if err != nil {
+		return nil, err
+	}
+	for _, file := range candidates {
+		metadataOnly, err := m.isMetadataOnly(folder, file)
+		if err != nil {
+			return nil, err
 		}
-		if record.State == MetadataOnly {
+		if metadataOnly {
 			names[file] = struct{}{}
 		}
 	}
-	return names, errFn()
+	return names, nil
 }
 
 func countForFileInfo(file protocol.FileInfo) db.Counts {
@@ -280,7 +322,30 @@ func (m *model) isMetadataOnly(folder, file string) (bool, error) {
 	}
 
 	record, ok, err := m.virtualFileRecord(folder, file)
-	if err != nil || !ok {
+	if err != nil {
+		_, clearErr := m.clearVirtualFilePresence(folder, file)
+		return false, clearErr
+	}
+	if !ok {
+		return false, nil
+	}
+	if record.State != MetadataOnly {
+		return false, nil
+	}
+	if m.virtualFileIgnored(folder, file) {
+		_, err := m.clearVirtualFilePresence(folder, file)
+		return false, err
+	}
+	if local, ok, err := m.sdb.GetDeviceFile(folder, protocol.LocalDeviceID, file); err != nil {
+		return false, err
+	} else if ok && !local.IsDeleted() {
+		_, err := m.clearVirtualFilePresence(folder, file)
+		return false, err
+	}
+	if global, ok, err := m.sdb.GetGlobalFile(folder, file); err != nil {
+		return false, err
+	} else if !ok || global.IsDeleted() || global.IsDirectory() || global.IsSymlink() {
+		_, err := m.clearVirtualFilePresence(folder, file)
 		return false, err
 	}
 	return record.State == MetadataOnly, nil
@@ -329,13 +394,27 @@ func (m *model) SetMetadataOnly(folder, file string) (FilePresence, error) {
 		return FilePresence{}, protocol.ErrInvalid
 	}
 
-	if _, ok := m.cfg.Folder(folder); !ok {
+	cfg, ok := m.cfg.Folder(folder)
+	if !ok {
 		return FilePresence{}, ErrFolderMissing
+	}
+
+	lock := m.virtualFileMuts.Get(virtualFileMutexKey(folder, name))
+	lock.Lock()
+	defer lock.Unlock()
+
+	if m.virtualFileIgnored(folder, name) {
+		return FilePresence{}, ErrVirtualFileIgnored
 	}
 
 	if local, ok, err := m.sdb.GetDeviceFile(folder, protocol.LocalDeviceID, name); err != nil {
 		return FilePresence{}, err
 	} else if ok && !local.IsDeleted() {
+		return FilePresence{}, ErrVirtualFileAlreadyLocal
+	}
+	if exists, err := virtualFileExistsLocally(cfg.Filesystem(), name); err != nil {
+		return FilePresence{}, err
+	} else if exists {
 		return FilePresence{}, ErrVirtualFileAlreadyLocal
 	}
 
@@ -397,4 +476,26 @@ func (m *model) VirtualFilePresence(folder, file string) (FilePresence, error) {
 	}
 
 	return FilePresence{}, protocol.ErrNoSuchFile
+}
+
+func (m *model) pruneVirtualFilePresenceAfterRemoteUpdate(folder string, files []protocol.FileInfo, update bool) error {
+	if update {
+		for _, file := range files {
+			if _, err := m.isMetadataOnly(folder, file.Name); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	names, err := m.virtualFileRecordNames(folder)
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		if _, err := m.isMetadataOnly(folder, name); err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -1782,27 +1782,13 @@ func (f *sendReceiveFolder) materializeVirtualFile(ctx context.Context, file pro
 	if err := state.failed(); err != nil {
 		return err
 	}
-
-	dbUpdateChan := make(chan dbUpdateJob, 1)
-	scanChan := make(chan string, 1)
-	if err := f.performFinish(file, protocol.FileInfo{}, false, tempName, dbUpdateChan, scanChan); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-
-	close(dbUpdateChan)
-	close(scanChan)
-
-	var updates []protocol.FileInfo
-	for job := range dbUpdateChan {
-		if job.jobType == dbUpdateHandleFile {
-			updates = append(updates, job.file)
-		}
+	if err := f.finishVirtualFileMaterialization(file, tempName); err != nil {
+		return err
 	}
-	if len(updates) == 0 {
-		updates = []protocol.FileInfo{file}
-	}
-
-	return f.updateLocalsFromVirtualFiles(updates)
+	return f.updateLocalsFromVirtualFiles([]protocol.FileInfo{file})
 }
 
 func (f *sendReceiveFolder) checkVirtualFileParent(file string) error {
@@ -1822,6 +1808,61 @@ func (f *sendReceiveFolder) checkVirtualFileParent(file string) error {
 	}
 
 	return f.mtimefs.MkdirAll(parent, 0o755)
+}
+
+func (f *sendReceiveFolder) finishVirtualFileMaterialization(file protocol.FileInfo, tempName string) error {
+	if err := f.ensureVirtualFileMaterializationCurrent(file); err != nil {
+		return err
+	}
+	if f.ignores.Match(file.Name).IsIgnored() {
+		return ErrVirtualFileIgnored
+	}
+
+	if !f.IgnorePerms && !file.NoPermissions {
+		if err := f.mtimefs.Chmod(tempName, fs.FileMode(file.Permissions&0o777)); err != nil {
+			return fmt.Errorf("setting permissions: %w", err)
+		}
+	}
+
+	if err := f.setPlatformData(&file, tempName); err != nil {
+		return fmt.Errorf("setting metadata: %w", err)
+	}
+	if err := f.ensureVirtualFileMaterializationCurrent(file); err != nil {
+		return err
+	}
+	if f.ignores.Match(file.Name).IsIgnored() {
+		return ErrVirtualFileIgnored
+	}
+
+	if _, err := f.mtimefs.Lstat(file.Name); err == nil || fs.IsErrCaseConflict(err) {
+		return ErrVirtualFileAlreadyLocal
+	} else if !fs.IsNotExist(err) {
+		return fmt.Errorf("checking existing file: %w", err)
+	}
+
+	if err := osutil.RenameOrCopy(f.CopyRangeMethod.ToFS(), f.mtimefs, f.mtimefs, tempName, file.Name); err != nil {
+		return fmt.Errorf("replacing file: %w", err)
+	}
+
+	f.mtimefs.Chtimes(file.Name, file.ModTime(), file.ModTime()) // never fails
+	return nil
+}
+
+func (f *sendReceiveFolder) ensureVirtualFileMaterializationCurrent(file protocol.FileInfo) error {
+	current, ok, err := f.model.sdb.GetGlobalFile(f.folderID, file.Name)
+	if err != nil {
+		return err
+	}
+	if !ok || current.IsDeleted() {
+		return protocol.ErrNoSuchFile
+	}
+	if current.IsDirectory() || current.IsSymlink() {
+		return ErrVirtualFileNotSupported
+	}
+	if !current.Version.Equal(file.Version) {
+		return ErrVirtualFileStale
+	}
+	return nil
 }
 
 func (f *sendReceiveFolder) Jobs(page, perpage int) ([]string, []string, int) {

@@ -1239,6 +1239,40 @@ func TestDebugVirtualFileMetadataOnlyMutation(t *testing.T) {
 	}
 }
 
+func TestDebugVirtualFileMetadataOnlyValidationErrors(t *testing.T) {
+	t.Parallel()
+
+	cfg := newMockedConfig()
+	cfg.GUIReturns(config.GUIConfiguration{APIKey: testAPIKey, RawAddress: "127.0.0.1:0"})
+	cfg.OptionsReturns(config.OptionsConfiguration{ExperimentalVirtualFiles: true})
+
+	mock := &virtualFileAPITestModel{
+		Model:  new(modelmocks.Model),
+		setErr: model.ErrVirtualFileIgnored,
+	}
+
+	baseURL := startHTTPWithModel(t, cfg, mock)
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/rest/debug/virtual-file/metadata-only?folder=default&file=foo", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-API-Key", testAPIKey)
+
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict, got %s", resp.Status)
+	}
+	if !mock.setCalled {
+		t.Fatal("expected SetMetadataOnly to be called")
+	}
+}
+
 func TestDebugVirtualFileFetch(t *testing.T) {
 	t.Parallel()
 
@@ -1295,6 +1329,52 @@ func TestDebugVirtualFileFetch(t *testing.T) {
 	}
 	if !data.ExperimentalVirtualFiles {
 		t.Fatal("expected experimentalVirtualFiles to be true in response")
+	}
+}
+
+func TestDebugVirtualFileFetchValidationErrors(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{name: "ignored", err: model.ErrVirtualFileIgnored},
+		{name: "stale", err: model.ErrVirtualFileStale},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := newMockedConfig()
+			cfg.GUIReturns(config.GUIConfiguration{APIKey: testAPIKey, RawAddress: "127.0.0.1:0"})
+			cfg.OptionsReturns(config.OptionsConfiguration{ExperimentalVirtualFiles: true})
+
+			mock := &virtualFileAPITestModel{
+				Model:    new(modelmocks.Model),
+				fetchErr: tc.err,
+			}
+
+			baseURL := startHTTPWithModel(t, cfg, mock)
+
+			req, err := http.NewRequest(http.MethodPost, baseURL+"/rest/debug/virtual-file/fetch?folder=default&file=foo", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("X-API-Key", testAPIKey)
+
+			resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusConflict {
+				t.Fatalf("expected 409 Conflict, got %s", resp.Status)
+			}
+			if !mock.fetchCalled {
+				t.Fatal("expected FetchVirtualFile to be called")
+			}
+		})
 	}
 }
 

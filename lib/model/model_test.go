@@ -562,11 +562,132 @@ func TestVirtualFileCorruptMetadataFailsSafely(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := m.VirtualFilePresence(fcfg.ID, "broken.txt"); err == nil {
-		t.Fatal("expected corrupt virtual-file metadata to return an error")
+	if _, err := m.VirtualFilePresence(fcfg.ID, "broken.txt"); !errors.Is(err, protocol.ErrNoSuchFile) {
+		t.Fatalf("expected corrupt virtual-file metadata to be pruned, got %v", err)
 	}
-	if _, err := m.FetchVirtualFile(context.Background(), fcfg.ID, "broken.txt"); err == nil {
-		t.Fatal("expected corrupt virtual-file metadata to fail fetch")
+	if _, err := m.FetchVirtualFile(context.Background(), fcfg.ID, "broken.txt"); !errors.Is(err, ErrVirtualFileNotMetadataOnly) {
+		t.Fatalf("expected corrupt virtual-file metadata fetch to fail safely, got %v", err)
+	}
+	if metadataOnly, err := m.isMetadataOnly(fcfg.ID, "broken.txt"); err != nil {
+		t.Fatal(err)
+	} else if metadataOnly {
+		t.Fatal("corrupt placeholder record should be removed")
+	}
+}
+
+func TestSetMetadataOnlyRejectsExistingUnscannedDiskFile(t *testing.T) {
+	wrapper, fcfg := newDefaultCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	fc := newFakeConnection(device1, m)
+	fc.addFile("present.txt", 0o644, protocol.FileInfoTypeFile, []byte("remote"))
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(fc.files[0])}); err != nil {
+		t.Fatal(err)
+	}
+
+	writeFile(t, fcfg.Filesystem(), "present.txt", []byte("local"))
+
+	if _, err := m.SetMetadataOnly(fcfg.ID, "present.txt"); !errors.Is(err, ErrVirtualFileAlreadyLocal) {
+		t.Fatalf("expected ErrVirtualFileAlreadyLocal, got %v", err)
+	}
+	if metadataOnly, err := m.isMetadataOnly(fcfg.ID, "present.txt"); err != nil {
+		t.Fatal(err)
+	} else if metadataOnly {
+		t.Fatal("placeholder state should not be written for an existing local file")
+	}
+}
+
+func TestVirtualFileIgnoredPathsAreRejectedAndPruned(t *testing.T) {
+	wrapper, fcfg := newDefaultCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	if err := m.SetIgnores(fcfg.ID, []string{"ignored.txt"}); err != nil {
+		t.Fatal(err)
+	}
+
+	fc := newFakeConnection(device1, m)
+	fc.addFile("ignored.txt", 0o644, protocol.FileInfoTypeFile, []byte("remote"))
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(fc.files[0])}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.SetMetadataOnly(fcfg.ID, "ignored.txt"); !errors.Is(err, ErrVirtualFileIgnored) {
+		t.Fatalf("expected ErrVirtualFileIgnored from SetMetadataOnly, got %v", err)
+	}
+
+	record := virtualFileRecord{
+		State:   MetadataOnly,
+		Updated: time.Now().UTC(),
+	}
+	bs, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.virtualFileRecordStore(fcfg.ID).PutBytes("ignored.txt", bs); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.FetchVirtualFile(context.Background(), fcfg.ID, "ignored.txt"); !errors.Is(err, ErrVirtualFileIgnored) {
+		t.Fatalf("expected ErrVirtualFileIgnored from FetchVirtualFile, got %v", err)
+	}
+	if metadataOnly, err := m.isMetadataOnly(fcfg.ID, "ignored.txt"); err != nil {
+		t.Fatal(err)
+	} else if metadataOnly {
+		t.Fatal("ignored placeholder should be pruned")
+	}
+}
+
+func TestVirtualFileRemoteDeleteClearsPlaceholderState(t *testing.T) {
+	wrapper, fcfg := newDefaultCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	fc := addFakeConn(m, device1, fcfg.ID)
+	fc.addFile("gone.txt", 0o644, protocol.FileInfoTypeFile, []byte("remote"))
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(fc.files[0])}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.SetMetadataOnly(fcfg.ID, "gone.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	fc.deleteFile("gone.txt")
+	fc.sendIndexUpdate()
+
+	if _, err := m.VirtualFilePresence(fcfg.ID, "gone.txt"); !errors.Is(err, protocol.ErrNoSuchFile) {
+		t.Fatalf("expected protocol.ErrNoSuchFile after remote delete, got %v", err)
+	}
+	if metadataOnly, err := m.isMetadataOnly(fcfg.ID, "gone.txt"); err != nil {
+		t.Fatal(err)
+	} else if metadataOnly {
+		t.Fatal("placeholder state should be cleared after remote delete")
 	}
 }
 
@@ -595,6 +716,15 @@ func TestVirtualFileValidationErrors(t *testing.T) {
 	if _, err := m.FetchVirtualFile(context.Background(), fcfg.ID, "../bad"); !errors.Is(err, protocol.ErrInvalid) {
 		t.Fatalf("expected protocol.ErrInvalid from FetchVirtualFile, got %v", err)
 	}
+	if _, err := m.SetMetadataOnly(fcfg.ID, ""); !errors.Is(err, protocol.ErrInvalid) {
+		t.Fatalf("expected protocol.ErrInvalid for empty path from SetMetadataOnly, got %v", err)
+	}
+	if _, err := m.FetchVirtualFile(context.Background(), fcfg.ID, ""); !errors.Is(err, protocol.ErrInvalid) {
+		t.Fatalf("expected protocol.ErrInvalid for empty path from FetchVirtualFile, got %v", err)
+	}
+	if _, err := m.VirtualFilePresence(fcfg.ID, ""); !errors.Is(err, protocol.ErrInvalid) {
+		t.Fatalf("expected protocol.ErrInvalid for empty path from VirtualFilePresence, got %v", err)
+	}
 }
 
 type virtualFileHookRecorder struct {
@@ -612,6 +742,12 @@ func (r *virtualFileHookRecorder) snapshot() []VirtualFileEvent {
 	r.mut.Lock()
 	defer r.mut.Unlock()
 	return append([]VirtualFileEvent(nil), r.events...)
+}
+
+type panicVirtualFileHook struct{}
+
+func (*panicVirtualFileHook) HandleVirtualFileEvent(VirtualFileEvent) {
+	panic("hook panic")
 }
 
 func TestVirtualFileHooksReceiveLifecycleEvents(t *testing.T) {
@@ -664,6 +800,161 @@ func TestVirtualFileHooksReceiveLifecycleEvents(t *testing.T) {
 	}
 	if events[2].State != FullLocal || events[3].State != FullLocal {
 		t.Fatalf("expected FullLocal events after fetch, got %+v", events)
+	}
+}
+
+func TestVirtualFilePanickingHookDoesNotBreakOperations(t *testing.T) {
+	wrapper, fcfg := newDefaultCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	fc := addFakeConn(m, device1, fcfg.ID)
+	fc.addFile("hookpanic.txt", 0o644, protocol.FileInfoTypeFile, []byte("hook panic"))
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(fc.files[0])}); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := &virtualFileHookRecorder{}
+	unregisterPanic := m.RegisterVirtualFilesystemHook(&panicVirtualFileHook{})
+	defer unregisterPanic()
+	unregisterRecorder := m.RegisterVirtualFilesystemHook(recorder)
+	defer unregisterRecorder()
+
+	if _, err := m.SetMetadataOnly(fcfg.ID, "hookpanic.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.FetchVirtualFile(context.Background(), fcfg.ID, "hookpanic.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := len(recorder.snapshot()); got == 0 {
+		t.Fatal("expected non-panicking hooks to continue receiving events")
+	}
+}
+
+func TestFetchVirtualFileCorruptedRemoteDataFailsSafely(t *testing.T) {
+	wrapper, fcfg := newDefaultCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	fc := addFakeConn(m, device1, fcfg.ID)
+	data := []byte("corruption")
+	fc.addFile("corrupt.txt", 0o644, protocol.FileInfoTypeFile, data)
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(fc.files[0])}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.SetMetadataOnly(fcfg.ID, "corrupt.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	fc.mut.Lock()
+	fc.fileData["corrupt.txt"] = append([]byte(nil), data...)
+	fc.fileData["corrupt.txt"][0] ^= 0xff
+	fc.mut.Unlock()
+
+	if _, err := m.FetchVirtualFile(context.Background(), fcfg.ID, "corrupt.txt"); err == nil {
+		t.Fatal("expected fetch to fail on corrupted remote content")
+	}
+
+	presence, err := m.VirtualFilePresence(fcfg.ID, "corrupt.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presence.State != MetadataOnly {
+		t.Fatalf("expected placeholder to remain metadata-only after corruption, got %+v", presence)
+	}
+	if _, err := fcfg.Filesystem().Lstat("corrupt.txt"); !fs.IsNotExist(err) {
+		t.Fatalf("expected no materialized file after corruption, got err=%v", err)
+	}
+	if _, err := fcfg.Filesystem().Lstat(fs.TempName("corrupt.txt")); !fs.IsNotExist(err) {
+		t.Fatalf("expected temp file cleanup after corruption, got err=%v", err)
+	}
+}
+
+func TestFetchVirtualFileConcurrentRequests(t *testing.T) {
+	wrapper, fcfg := newDefaultCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	fc := addFakeConn(m, device1, fcfg.ID)
+	data := []byte("concurrent payload")
+	fc.addFile("concurrent.txt", 0o644, protocol.FileInfoTypeFile, data)
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(fc.files[0])}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.SetMetadataOnly(fcfg.ID, "concurrent.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	const workers = 8
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			_, err := m.FetchVirtualFile(context.Background(), fcfg.ID, "concurrent.txt")
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	var successes int
+	for err := range errs {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrVirtualFileNotMetadataOnly), errors.Is(err, ErrVirtualFileAlreadyLocal):
+		default:
+			t.Fatalf("unexpected concurrent fetch error: %v", err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("expected exactly one successful fetch, got %d", successes)
+	}
+
+	fd, err := fcfg.Filesystem().Open("concurrent.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fd.Close()
+
+	got, err := io.ReadAll(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("unexpected materialized contents: got %q want %q", got, data)
+	}
+	if _, err := fcfg.Filesystem().Lstat(fs.TempName("concurrent.txt")); !fs.IsNotExist(err) {
+		t.Fatalf("expected temp file cleanup after concurrent fetch, got err=%v", err)
 	}
 }
 

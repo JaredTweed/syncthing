@@ -19,6 +19,7 @@ var (
 	ErrVirtualFileNotMetadataOnly    = errors.New("file is not metadata-only")
 	ErrVirtualFileFetchUnsupported   = errors.New("explicit virtual-file fetch is not supported for this folder")
 	ErrVirtualFileContentUnavailable = errors.New("no connected device has the required version")
+	ErrVirtualFileStale              = errors.New("file changed while being materialized")
 )
 
 type virtualFileMaterializer interface {
@@ -40,6 +41,25 @@ func (m *model) FetchVirtualFile(ctx context.Context, folder, file string) (File
 	cfg, ok := m.cfg.Folder(folder)
 	if !ok {
 		return FilePresence{}, ErrFolderMissing
+	}
+
+	lock := m.virtualFileMuts.Get(virtualFileMutexKey(folder, name))
+	lock.Lock()
+	defer lock.Unlock()
+
+	if m.virtualFileIgnored(folder, name) {
+		if _, err := m.clearVirtualFilePresence(folder, name); err != nil {
+			return FilePresence{}, err
+		}
+		return FilePresence{}, ErrVirtualFileIgnored
+	}
+	if exists, err := virtualFileExistsLocally(cfg.Filesystem(), name); err != nil {
+		return FilePresence{}, err
+	} else if exists {
+		if _, err := m.clearVirtualFilePresence(folder, name); err != nil {
+			return FilePresence{}, err
+		}
+		return FilePresence{}, ErrVirtualFileAlreadyLocal
 	}
 
 	metadataOnly, err := m.isMetadataOnly(folder, name)

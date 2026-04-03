@@ -152,6 +152,8 @@ Phase 3 implementation notes:
 - Only the explicitly requested metadata-only file is materialized; the normal background pull queue remains unchanged.
 - The default backend reuses Syncthing's existing block request and hash verification logic, writes a temp file, renames it into place, updates the local index, and clears the metadata-only record on success.
 - Failures leave the metadata-only record in place and do not create an OS-visible placeholder file.
+- The explicit fetch finisher is now separate from the normal pull/conflict finisher to avoid reusing scan-queue side effects in a one-shot API path.
+- Fetch revalidates that the current global file is still the same regular-file version before making the content visible locally.
 
 ### Phase 4: Desktop Virtual Filesystem Integration Hooks
 
@@ -163,6 +165,7 @@ Phase 4 implementation notes:
 - Desktop integration is represented by an internal `VirtualFilesystemHook` interface and `VirtualFileEvent` lifecycle callbacks.
 - The current hooks report placeholder creation, explicit fetch start/completion/failure, and placeholder clearing when a real local file update supersedes a placeholder.
 - No platform-specific filesystem driver, kernel integration, or OS placeholder exposure is included in this phase.
+- Hook dispatch is synchronous for ordering, but now recovers from hook panics so experimental integrations cannot crash the core model.
 
 ### Phase 5: Optional Content-Addressed Backend Interface
 
@@ -175,3 +178,16 @@ Phase 5 implementation notes:
 - A `ContentAddressableBackend` interface now exists alongside the main content backend seam.
 - The default implementation is a local no-op backend (`localNoop`) that reports content addressing as unsupported and adds no mandatory dependencies.
 - The debug virtual-file responses expose the current content backend type and the content-addressed backend capability so future adapters can be validated without changing the wire protocol.
+
+## Hardening Notes
+
+- Metadata-only records are now self-healing:
+  - corrupt records are pruned on access
+  - ignored paths are rejected and stale placeholder records for them are removed
+  - remote deletes and unsupported type changes prune stale placeholder records
+  - local index updates still clear placeholder state when a real local file supersedes it
+- Explicit mutation and fetch reject empty or root-like paths (`""`, `"."`) as invalid.
+- `SetMetadataOnly` now checks both the local index and the real filesystem, so an unscanned local file cannot be overwritten by a placeholder record.
+- Fetch failure keeps the metadata-only record in place and cleans up the temporary file.
+- Restart safety still relies on Syncthing's normal temp-file cleanup and local scan/update behavior. If a crash happens after a successful rename but before the local index update, the next scan should reconcile the local index and clear stale placeholder metadata.
+- Remaining limitation: the current filesystem abstraction does not expose an atomic "rename without replace" primitive. The fetch path rechecks that the destination is absent immediately before publish, but there is still a small TOCTOU window where an out-of-band local writer could create the final path between that check and the final rename/copy.

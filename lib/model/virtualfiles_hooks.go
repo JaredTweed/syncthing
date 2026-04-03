@@ -6,7 +6,12 @@
 
 package model
 
-import "time"
+import (
+	"log/slog"
+	"time"
+
+	"github.com/syncthing/syncthing/internal/slogutil"
+)
 
 // VirtualFileEventType describes internal lifecycle events that a future
 // desktop virtual filesystem bridge can subscribe to.
@@ -78,6 +83,16 @@ func (m *model) notifyVirtualFileHooks(event VirtualFileEvent) {
 	m.mut.RUnlock()
 
 	for _, hook := range hooks {
-		hook.HandleVirtualFileEvent(event)
+		if hook == nil {
+			continue
+		}
+		func(hook VirtualFilesystemHook) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					slog.Error("Virtual-file hook panicked", slog.String("folder", event.Folder), slogutil.FilePath(event.File), slog.String("type", string(event.Type)), slog.Any("panic", recovered))
+				}
+			}()
+			hook.HandleVirtualFileEvent(event)
+		}(hook)
 	}
 }

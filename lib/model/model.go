@@ -154,12 +154,13 @@ type model struct {
 	// Experimental virtual-file content backend. The default keeps the normal
 	// local filesystem behavior and is only used by the explicit virtual-file
 	// debug APIs at this stage.
-	contentBackend ContentBackend
-	fatalChan      chan error
-	started        chan struct{}
-	keyGen         *protocol.KeyGenerator
-	promotionTimer *time.Timer
-	observed       *db.ObservedDB
+	contentBackend  ContentBackend
+	fatalChan       chan error
+	started         chan struct{}
+	keyGen          *protocol.KeyGenerator
+	promotionTimer  *time.Timer
+	observed        *db.ObservedDB
+	virtualFileMuts syncMutexMap
 
 	// fields protected by mut
 	mut                            sync.RWMutex
@@ -1202,7 +1203,16 @@ func (m *model) handleIndex(conn protocol.Connection, folder string, fs []protoc
 		return fmt.Errorf("%s: %w", folder, ErrFolderNotRunning)
 	}
 
-	return indexHandler.ReceiveIndex(folder, fs, update, op, prevSequence, lastSequence)
+	if err := indexHandler.ReceiveIndex(folder, fs, update, op, prevSequence, lastSequence); err != nil {
+		return err
+	}
+
+	if m.experimentalVirtualFilesEnabled() {
+		if err := m.pruneVirtualFilePresenceAfterRemoteUpdate(folder, fs, update); err != nil {
+			slog.Warn("Failed to prune virtual-file metadata after remote index update", slog.String("folder", folder), slogutil.Error(err))
+		}
+	}
+	return nil
 }
 
 type clusterConfigDeviceInfo struct {

@@ -1072,6 +1072,8 @@ func (s *service) postDebugVirtualFileMetadataOnly(w http.ResponseWriter, r *htt
 		switch {
 		case errors.Is(err, model.ErrExperimentalVirtualFilesDisabled):
 			status = http.StatusConflict
+		case errors.Is(err, model.ErrVirtualFileIgnored):
+			status = http.StatusConflict
 		case errors.Is(err, model.ErrVirtualFileAlreadyLocal):
 			status = http.StatusConflict
 		case errors.Is(err, model.ErrVirtualFileNotSupported):
@@ -1117,6 +1119,8 @@ func (s *service) postDebugVirtualFileFetch(w http.ResponseWriter, r *http.Reque
 		status := http.StatusInternalServerError
 		switch {
 		case errors.Is(err, model.ErrExperimentalVirtualFilesDisabled):
+			status = http.StatusConflict
+		case errors.Is(err, model.ErrVirtualFileIgnored), errors.Is(err, model.ErrVirtualFileStale):
 			status = http.StatusConflict
 		case errors.Is(err, model.ErrVirtualFileAlreadyLocal):
 			status = http.StatusConflict
