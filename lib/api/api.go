@@ -341,6 +341,7 @@ func (s *service) Serve(ctx context.Context) error {
 	debugMux.HandleFunc("/rest/debug/file", s.getDebugFile)
 	debugMux.HandleFunc("/rest/debug/virtual-file", s.getDebugVirtualFile)
 	debugMux.HandleFunc("/rest/debug/virtual-file/metadata-only", s.postDebugVirtualFileMetadataOnly)
+	debugMux.HandleFunc("/rest/debug/virtual-file/fetch", s.postDebugVirtualFileFetch)
 	restMux.Handler(http.MethodGet, "/rest/debug/*method", debugMux)
 	restMux.Handler(http.MethodPost, "/rest/debug/*method", debugMux)
 
@@ -985,6 +986,10 @@ type virtualFileMutationProvider interface {
 	SetMetadataOnly(folder, file string) (model.FilePresence, error)
 }
 
+type virtualFileFetchProvider interface {
+	FetchVirtualFile(ctx context.Context, folder, file string) (model.FilePresence, error)
+}
+
 func (s *service) getDebugVirtualFile(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 	folder := qs.Get("folder")
@@ -1004,11 +1009,13 @@ func (s *service) getDebugVirtualFile(w http.ResponseWriter, r *http.Request) {
 		}
 
 		sendJSON(w, map[string]interface{}{
-			"folder":                   presence.Folder,
-			"file":                     presence.File,
-			"state":                    presence.State,
-			"backend":                  presence.Backend,
-			"experimentalVirtualFiles": opts.ExperimentalVirtualFiles,
+			"folder":                    presence.Folder,
+			"file":                      presence.File,
+			"state":                     presence.State,
+			"backend":                   presence.Backend,
+			"contentAddressableBackend": presence.ContentAddressableBackend,
+			"contentAddressableEnabled": presence.ContentAddressableEnabled,
+			"experimentalVirtualFiles":  opts.ExperimentalVirtualFiles,
 		})
 		return
 	}
@@ -1033,11 +1040,13 @@ func (s *service) getDebugVirtualFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sendJSON(w, map[string]interface{}{
-		"folder":                   folder,
-		"file":                     file,
-		"state":                    model.FullLocal,
-		"backend":                  "localFilesystem",
-		"experimentalVirtualFiles": opts.ExperimentalVirtualFiles,
+		"folder":                    folder,
+		"file":                      file,
+		"state":                     model.FullLocal,
+		"backend":                   "localFilesystem",
+		"contentAddressableBackend": "localNoop",
+		"contentAddressableEnabled": false,
+		"experimentalVirtualFiles":  opts.ExperimentalVirtualFiles,
 	})
 }
 
@@ -1077,11 +1086,63 @@ func (s *service) postDebugVirtualFileMetadataOnly(w http.ResponseWriter, r *htt
 	}
 
 	sendJSON(w, map[string]interface{}{
-		"folder":                   presence.Folder,
-		"file":                     presence.File,
-		"state":                    presence.State,
-		"backend":                  presence.Backend,
-		"experimentalVirtualFiles": s.cfg.Options().ExperimentalVirtualFiles,
+		"folder":                    presence.Folder,
+		"file":                      presence.File,
+		"state":                     presence.State,
+		"backend":                   presence.Backend,
+		"contentAddressableBackend": presence.ContentAddressableBackend,
+		"contentAddressableEnabled": presence.ContentAddressableEnabled,
+		"experimentalVirtualFiles":  s.cfg.Options().ExperimentalVirtualFiles,
+	})
+}
+
+func (s *service) postDebugVirtualFileFetch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	provider, ok := s.model.(virtualFileFetchProvider)
+	if !ok {
+		http.Error(w, "virtual file fetch unavailable", http.StatusInternalServerError)
+		return
+	}
+
+	qs := r.URL.Query()
+	folder := qs.Get("folder")
+	file := qs.Get("file")
+
+	presence, err := provider.FetchVirtualFile(r.Context(), folder, file)
+	if err != nil {
+		status := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, model.ErrExperimentalVirtualFilesDisabled):
+			status = http.StatusConflict
+		case errors.Is(err, model.ErrVirtualFileAlreadyLocal):
+			status = http.StatusConflict
+		case errors.Is(err, model.ErrVirtualFileNotMetadataOnly):
+			status = http.StatusConflict
+		case errors.Is(err, model.ErrVirtualFileContentUnavailable):
+			status = http.StatusConflict
+		case errors.Is(err, model.ErrVirtualFileFetchUnsupported), errors.Is(err, model.ErrVirtualFileNotSupported):
+			status = http.StatusBadRequest
+		case isFolderNotFound(err), errors.Is(err, protocol.ErrNoSuchFile):
+			status = http.StatusNotFound
+		case errors.Is(err, protocol.ErrInvalid):
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+
+	sendJSON(w, map[string]interface{}{
+		"folder":                    presence.Folder,
+		"file":                      presence.File,
+		"state":                     presence.State,
+		"backend":                   presence.Backend,
+		"contentAddressableBackend": presence.ContentAddressableBackend,
+		"contentAddressableEnabled": presence.ContentAddressableEnabled,
+		"experimentalVirtualFiles":  s.cfg.Options().ExperimentalVirtualFiles,
 	})
 }
 

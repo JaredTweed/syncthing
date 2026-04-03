@@ -1263,6 +1263,10 @@ func (f *folder) updateLocalsFromPulling(fs []protocol.FileInfo) error {
 	return nil
 }
 
+func (f *folder) updateLocalsFromVirtualFiles(fs []protocol.FileInfo) error {
+	return f.updateLocals(fs)
+}
+
 func (f *folder) updateLocals(fs []protocol.FileInfo) error {
 	if err := f.db.Update(f.folderID, protocol.LocalDeviceID, fs); err != nil {
 		return err
@@ -1277,8 +1281,23 @@ func (f *folder) updateLocals(fs []protocol.FileInfo) error {
 	}
 	f.forcedRescanPathsMut.Unlock()
 
-	if err := f.model.clearVirtualFilePresenceBatch(f.folderID, filenames); err != nil {
+	cleared, err := f.model.clearVirtualFilePresenceBatch(f.folderID, filenames)
+	if err != nil {
 		return err
+	}
+	if len(cleared) > 0 {
+		clearedNames := make(map[string]struct{}, len(cleared))
+		for _, name := range cleared {
+			clearedNames[name] = struct{}{}
+		}
+		backend := f.model.currentContentBackend()
+		for _, file := range fs {
+			if _, ok := clearedNames[file.Name]; !ok || file.IsDeleted() {
+				continue
+			}
+			presence := newFilePresence(f.folderID, file.Name, backend.PresenceForFile(f.FolderConfiguration, file), backend)
+			f.model.notifyVirtualFileHooks(f.model.newVirtualFileEvent(VirtualFileEventPresenceChanged, presence, nil))
+		}
 	}
 
 	seq, err := f.db.GetDeviceSequence(f.folderID, protocol.LocalDeviceID)

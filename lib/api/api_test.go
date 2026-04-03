@@ -219,9 +219,11 @@ type httpTestCase struct {
 
 type virtualFileAPITestModel struct {
 	*modelmocks.Model
-	presence  model.FilePresence
-	setErr    error
-	setCalled bool
+	presence    model.FilePresence
+	setErr      error
+	setCalled   bool
+	fetchErr    error
+	fetchCalled bool
 }
 
 func (m *virtualFileAPITestModel) VirtualFilePresence(folder, file string) (model.FilePresence, error) {
@@ -232,6 +234,14 @@ func (m *virtualFileAPITestModel) SetMetadataOnly(folder, file string) (model.Fi
 	m.setCalled = true
 	if m.setErr != nil {
 		return model.FilePresence{}, m.setErr
+	}
+	return m.presence, nil
+}
+
+func (m *virtualFileAPITestModel) FetchVirtualFile(context.Context, string, string) (model.FilePresence, error) {
+	m.fetchCalled = true
+	if m.fetchErr != nil {
+		return model.FilePresence{}, m.fetchErr
 	}
 	return m.presence, nil
 }
@@ -1144,11 +1154,13 @@ func TestDebugVirtualFilePresenceFullLocal(t *testing.T) {
 	}
 
 	var data struct {
-		Folder                   string `json:"folder"`
-		File                     string `json:"file"`
-		State                    string `json:"state"`
-		Backend                  string `json:"backend"`
-		ExperimentalVirtualFiles bool   `json:"experimentalVirtualFiles"`
+		Folder                    string `json:"folder"`
+		File                      string `json:"file"`
+		State                     string `json:"state"`
+		Backend                   string `json:"backend"`
+		ContentAddressableBackend string `json:"contentAddressableBackend"`
+		ContentAddressableEnabled bool   `json:"contentAddressableEnabled"`
+		ExperimentalVirtualFiles  bool   `json:"experimentalVirtualFiles"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		t.Fatal(err)
@@ -1159,6 +1171,9 @@ func TestDebugVirtualFilePresenceFullLocal(t *testing.T) {
 	}
 	if data.File != "foo" || data.Folder != "default" {
 		t.Fatalf("unexpected response payload: %+v", data)
+	}
+	if data.ContentAddressableBackend != "localNoop" || data.ContentAddressableEnabled {
+		t.Fatalf("unexpected content-addressed backend payload: %+v", data)
 	}
 	if data.ExperimentalVirtualFiles {
 		t.Fatal("expected experimentalVirtualFiles to be false in response")
@@ -1175,10 +1190,11 @@ func TestDebugVirtualFileMetadataOnlyMutation(t *testing.T) {
 	mock := &virtualFileAPITestModel{
 		Model: new(modelmocks.Model),
 		presence: model.FilePresence{
-			Folder:  "default",
-			File:    "foo",
-			State:   model.MetadataOnly,
-			Backend: "localFilesystem",
+			Folder:                    "default",
+			File:                      "foo",
+			State:                     model.MetadataOnly,
+			Backend:                   "localFilesystem",
+			ContentAddressableBackend: "localNoop",
 		},
 	}
 
@@ -1204,14 +1220,78 @@ func TestDebugVirtualFileMetadataOnlyMutation(t *testing.T) {
 	}
 
 	var data struct {
-		State                    string `json:"state"`
-		ExperimentalVirtualFiles bool   `json:"experimentalVirtualFiles"`
+		State                     string `json:"state"`
+		ContentAddressableBackend string `json:"contentAddressableBackend"`
+		ContentAddressableEnabled bool   `json:"contentAddressableEnabled"`
+		ExperimentalVirtualFiles  bool   `json:"experimentalVirtualFiles"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		t.Fatal(err)
 	}
 	if data.State != string(model.MetadataOnly) {
 		t.Fatalf("expected state %q, got %q", model.MetadataOnly, data.State)
+	}
+	if data.ContentAddressableBackend != "localNoop" || data.ContentAddressableEnabled {
+		t.Fatalf("unexpected content-addressed backend payload: %+v", data)
+	}
+	if !data.ExperimentalVirtualFiles {
+		t.Fatal("expected experimentalVirtualFiles to be true in response")
+	}
+}
+
+func TestDebugVirtualFileFetch(t *testing.T) {
+	t.Parallel()
+
+	cfg := newMockedConfig()
+	cfg.GUIReturns(config.GUIConfiguration{APIKey: testAPIKey, RawAddress: "127.0.0.1:0"})
+	cfg.OptionsReturns(config.OptionsConfiguration{ExperimentalVirtualFiles: true})
+
+	mock := &virtualFileAPITestModel{
+		Model: new(modelmocks.Model),
+		presence: model.FilePresence{
+			Folder:                    "default",
+			File:                      "foo",
+			State:                     model.FullLocal,
+			Backend:                   "localFilesystem",
+			ContentAddressableBackend: "localNoop",
+		},
+	}
+
+	baseURL := startHTTPWithModel(t, cfg, mock)
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/rest/debug/virtual-file/fetch?folder=default&file=foo", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-API-Key", testAPIKey)
+
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %s", resp.Status)
+	}
+	if !mock.fetchCalled {
+		t.Fatal("expected FetchVirtualFile to be called")
+	}
+
+	var data struct {
+		State                     string `json:"state"`
+		ContentAddressableBackend string `json:"contentAddressableBackend"`
+		ContentAddressableEnabled bool   `json:"contentAddressableEnabled"`
+		ExperimentalVirtualFiles  bool   `json:"experimentalVirtualFiles"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		t.Fatal(err)
+	}
+	if data.State != string(model.FullLocal) {
+		t.Fatalf("expected state %q, got %q", model.FullLocal, data.State)
+	}
+	if data.ContentAddressableBackend != "localNoop" || data.ContentAddressableEnabled {
+		t.Fatalf("unexpected content-addressed backend payload: %+v", data)
 	}
 	if !data.ExperimentalVirtualFiles {
 		t.Fatal("expected experimentalVirtualFiles to be true in response")

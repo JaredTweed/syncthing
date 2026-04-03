@@ -151,14 +151,15 @@ type model struct {
 	// folderIOLimiter limits the number of concurrent I/O heavy operations,
 	// such as scans and pulls.
 	folderIOLimiter *semaphore.Semaphore
-	// Experimental virtual-file content backend. Phase 1 defaults to current
-	// local filesystem behavior and is not yet on the data path.
+	// Experimental virtual-file content backend. The default keeps the normal
+	// local filesystem behavior and is only used by the explicit virtual-file
+	// debug APIs at this stage.
 	contentBackend ContentBackend
-	fatalChan       chan error
-	started         chan struct{}
-	keyGen          *protocol.KeyGenerator
-	promotionTimer  *time.Timer
-	observed        *db.ObservedDB
+	fatalChan      chan error
+	started        chan struct{}
+	keyGen         *protocol.KeyGenerator
+	promotionTimer *time.Timer
+	observed       *db.ObservedDB
 
 	// fields protected by mut
 	mut                            sync.RWMutex
@@ -166,13 +167,15 @@ type model struct {
 	deviceStatRefs                 map[protocol.DeviceID]*stats.DeviceStatisticsReference // deviceID -> statsRef
 	folderIgnores                  map[string]*ignore.Matcher                             // folder -> matcher object
 	folderRunners                  *serviceMap[string, service]                           // folder -> puller or scanner
-	folderRestartMuts              syncMutexMap                                           // folder -> restart mutex
-	folderVersioners               map[string]versioner.Versioner                         // folder -> versioner (may be nil)
-	folderEncryptionPasswordTokens map[string][]byte                                      // folder -> encryption token (may be missing, and only for encryption type folders)
-	folderEncryptionFailures       map[string]map[protocol.DeviceID]error                 // folder -> device -> error regarding encryption consistency (may be missing)
-	connections                    map[string]protocol.Connection                         // connection ID -> connection
-	deviceConnIDs                  map[protocol.DeviceID][]string                         // device -> connection IDs (invariant: if the key exists, the value is len >= 1, with the primary connection at the start of the slice)
-	promotedConnID                 map[protocol.DeviceID]string                           // device -> latest promoted connection ID
+	virtualFileHooks               map[int]VirtualFilesystemHook                          // hook ID -> hook
+	nextVirtualFileHookID          int
+	folderRestartMuts              syncMutexMap                           // folder -> restart mutex
+	folderVersioners               map[string]versioner.Versioner         // folder -> versioner (may be nil)
+	folderEncryptionPasswordTokens map[string][]byte                      // folder -> encryption token (may be missing, and only for encryption type folders)
+	folderEncryptionFailures       map[string]map[protocol.DeviceID]error // folder -> device -> error regarding encryption consistency (may be missing)
+	connections                    map[string]protocol.Connection         // connection ID -> connection
+	deviceConnIDs                  map[protocol.DeviceID][]string         // device -> connection IDs (invariant: if the key exists, the value is len >= 1, with the primary connection at the start of the slice)
+	promotedConnID                 map[protocol.DeviceID]string           // device -> latest promoted connection ID
 	connRequestLimiters            map[protocol.DeviceID]*semaphore.Semaphore
 	closed                         map[string]chan struct{} // connection ID -> closed channel
 	helloMessages                  map[protocol.DeviceID]protocol.Hello
@@ -244,6 +247,7 @@ func NewModel(cfg config.Wrapper, id protocol.DeviceID, sdb db.DB, protectedFile
 		deviceStatRefs:                 make(map[protocol.DeviceID]*stats.DeviceStatisticsReference),
 		folderIgnores:                  make(map[string]*ignore.Matcher),
 		folderRunners:                  newServiceMap[string, service](evLogger),
+		virtualFileHooks:               make(map[int]VirtualFilesystemHook),
 		folderVersioners:               make(map[string]versioner.Versioner),
 		folderEncryptionPasswordTokens: make(map[string][]byte),
 		folderEncryptionFailures:       make(map[string]map[protocol.DeviceID]error),

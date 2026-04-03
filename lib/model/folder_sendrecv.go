@@ -1725,6 +1725,105 @@ func (f *sendReceiveFolder) BringToFront(filename string) {
 	f.queue.BringToFront(filename)
 }
 
+func (f *sendReceiveFolder) materializeVirtualFile(ctx context.Context, file protocol.FileInfo) (err error) {
+	if file.IsDeleted() || file.Type != protocol.FileInfoTypeFile {
+		return ErrVirtualFileNotSupported
+	}
+
+	if _, statErr := f.mtimefs.Lstat(file.Name); statErr == nil {
+		return ErrVirtualFileAlreadyLocal
+	} else if !fs.IsNotExist(statErr) {
+		return statErr
+	}
+
+	if err := f.checkVirtualFileParent(file.Name); err != nil {
+		return err
+	}
+
+	if len(f.model.fileAvailability(f.FolderConfiguration, file)) == 0 {
+		return ErrVirtualFileContentUnavailable
+	}
+
+	if err := f.CheckAvailableSpace(uint64(file.Size)); err != nil { //nolint:gosec
+		return err
+	}
+
+	tempName := fs.TempName(file.Name)
+	_ = f.inWritableDir(f.mtimefs.Remove, tempName)
+	defer func() {
+		if err != nil {
+			_ = f.inWritableDir(f.mtimefs.Remove, tempName)
+		}
+	}()
+
+	populateOffsets(file.Blocks)
+
+	state := newSharedPullerState(file, f.mtimefs, f.folderID, tempName, file.Blocks, nil, f.IgnorePerms || file.NoPermissions, false, protocol.FileInfo{}, !f.DisableSparseFiles, !f.DisableFsync)
+	if f.Type != config.FolderTypeReceiveEncrypted {
+		f.model.progressEmitter.Register(state)
+		defer f.model.progressEmitter.Deregister(state)
+	}
+
+	pullResults := make(chan *sharedPullerState, 1)
+	for _, block := range file.Blocks {
+		f.pullBlock(ctx, pullBlockState{
+			sharedPullerState: state,
+			block:             block,
+		}, pullResults)
+		<-pullResults
+		if err := state.failed(); err != nil {
+			break
+		}
+	}
+
+	if closed, closeErr := state.finalClose(); closed && closeErr != nil {
+		return closeErr
+	}
+	if err := state.failed(); err != nil {
+		return err
+	}
+
+	dbUpdateChan := make(chan dbUpdateJob, 1)
+	scanChan := make(chan string, 1)
+	if err := f.performFinish(file, protocol.FileInfo{}, false, tempName, dbUpdateChan, scanChan); err != nil {
+		return err
+	}
+
+	close(dbUpdateChan)
+	close(scanChan)
+
+	var updates []protocol.FileInfo
+	for job := range dbUpdateChan {
+		if job.jobType == dbUpdateHandleFile {
+			updates = append(updates, job.file)
+		}
+	}
+	if len(updates) == 0 {
+		updates = []protocol.FileInfo{file}
+	}
+
+	return f.updateLocalsFromVirtualFiles(updates)
+}
+
+func (f *sendReceiveFolder) checkVirtualFileParent(file string) error {
+	parent := filepath.Dir(file)
+	if parent == "." {
+		return nil
+	}
+
+	if err := osutil.TraversesSymlink(f.mtimefs, parent); err != nil {
+		return fmt.Errorf("checking parent dirs: %w", err)
+	}
+
+	if _, err := f.mtimefs.Lstat(parent); err == nil {
+		return nil
+	} else if !fs.IsNotExist(err) {
+		return err
+	}
+
+	return f.mtimefs.MkdirAll(parent, 0o755)
+}
+
 func (f *sendReceiveFolder) Jobs(page, perpage int) ([]string, []string, int) {
 	return f.queue.Jobs(page, perpage)
 }

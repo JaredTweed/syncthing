@@ -41,10 +41,12 @@ var (
 // experiments. Phase 2 supports MetadataOnly records in the local metadata
 // plane while keeping the OS filesystem untouched.
 type FilePresence struct {
-	Folder  string        `json:"folder"`
-	File    string        `json:"file"`
-	State   PresenceState `json:"state"`
-	Backend string        `json:"backend"`
+	Folder                    string        `json:"folder"`
+	File                      string        `json:"file"`
+	State                     PresenceState `json:"state"`
+	Backend                   string        `json:"backend"`
+	ContentAddressableBackend string        `json:"contentAddressableBackend,omitempty"`
+	ContentAddressableEnabled bool          `json:"contentAddressableEnabled"`
 }
 
 // ContentReadRequest is reserved for future backend-routed reads. Phase 1
@@ -57,17 +59,20 @@ type ContentReadRequest struct {
 }
 
 // ContentBackend abstracts future file-content storage from the folder model.
-// Experimental: Phase 1 only wires the seam and a default local-filesystem
-// implementation. Request serving and pulling still use the existing paths.
+// Experimental: The default implementation keeps request serving and the
+// normal puller on the existing paths. Phase 3 starts routing only explicit
+// virtual-file materialization through this seam.
 //
 // TODO(experimentalVirtualFiles): Add metadata-plane lookups for files that do
 // not have local content.
-// TODO(experimentalVirtualFiles): Route explicit fetch and materialization
-// through this interface in later phases.
+// TODO(experimentalVirtualFiles): Route more of the content lifecycle through
+// this interface in later phases.
 type ContentBackend interface {
 	BackendType() string
 	PresenceForFile(folder config.FolderConfiguration, file protocol.FileInfo) PresenceState
 	ReadAt(ctx context.Context, folder config.FolderConfiguration, req ContentReadRequest, buf []byte) (int, error)
+	Materialize(ctx context.Context, m *model, folder config.FolderConfiguration, file protocol.FileInfo) error
+	ContentAddressableBackend() ContentAddressableBackend
 }
 
 type localFilesystemContentBackend struct{}
@@ -97,8 +102,45 @@ func (localFilesystemContentBackend) ReadAt(_ context.Context, folder config.Fol
 	return readOffsetIntoBuf(folder.Filesystem(), name, req.Offset, buf)
 }
 
+func (localFilesystemContentBackend) Materialize(ctx context.Context, m *model, folder config.FolderConfiguration, file protocol.FileInfo) error {
+	return m.materializeLocalFile(ctx, folder, file)
+}
+
+func (localFilesystemContentBackend) ContentAddressableBackend() ContentAddressableBackend {
+	return noopContentAddressableBackend{}
+}
+
 func (m *model) experimentalVirtualFilesEnabled() bool {
 	return m.cfg.Options().ExperimentalVirtualFiles
+}
+
+func (m *model) currentContentBackend() ContentBackend {
+	m.mut.RLock()
+	backend := m.contentBackend
+	m.mut.RUnlock()
+	if backend == nil {
+		backend = newContentBackend()
+	}
+	return backend
+}
+
+func newFilePresence(folder, file string, state PresenceState, backend ContentBackend) FilePresence {
+	if backend == nil {
+		backend = newContentBackend()
+	}
+
+	casBackend := backend.ContentAddressableBackend()
+	presence := FilePresence{
+		Folder:  folder,
+		File:    file,
+		State:   state,
+		Backend: backend.BackendType(),
+	}
+	if casBackend != nil {
+		presence.ContentAddressableBackend = casBackend.BackendType()
+		presence.ContentAddressableEnabled = casBackend.SupportsContentAddressing()
+	}
+	return presence
 }
 
 func normalizeVirtualFilePath(file string) (string, error) {
@@ -244,20 +286,37 @@ func (m *model) isMetadataOnly(folder, file string) (bool, error) {
 	return record.State == MetadataOnly, nil
 }
 
-func (m *model) clearVirtualFilePresence(folder, file string) error {
+func (m *model) clearVirtualFilePresence(folder, file string) (bool, error) {
 	if !m.experimentalVirtualFilesEnabled() {
-		return nil
+		return false, nil
 	}
-	return m.virtualFileRecordStore(folder).Delete(file)
+
+	store := m.virtualFileRecordStore(folder)
+	if bs, ok, err := store.Bytes(file); err != nil {
+		return false, err
+	} else if !ok {
+		return false, nil
+	} else {
+		var record virtualFileRecord
+		if err := json.Unmarshal(bs, &record); err != nil {
+			return true, store.Delete(file)
+		}
+		return true, store.Delete(file)
+	}
 }
 
-func (m *model) clearVirtualFilePresenceBatch(folder string, files []string) error {
+func (m *model) clearVirtualFilePresenceBatch(folder string, files []string) ([]string, error) {
+	cleared := make([]string, 0, len(files))
 	for _, file := range files {
-		if err := m.clearVirtualFilePresence(folder, file); err != nil {
-			return err
+		removed, err := m.clearVirtualFilePresence(folder, file)
+		if err != nil {
+			return nil, err
+		}
+		if removed {
+			cleared = append(cleared, file)
 		}
 	}
-	return nil
+	return cleared, nil
 }
 
 func (m *model) SetMetadataOnly(folder, file string) (FilePresence, error) {
@@ -303,7 +362,11 @@ func (m *model) SetMetadataOnly(folder, file string) (FilePresence, error) {
 		return FilePresence{}, err
 	}
 
-	return m.VirtualFilePresence(folder, name)
+	presence, err := m.VirtualFilePresence(folder, name)
+	if err == nil {
+		m.notifyVirtualFileHooks(m.newVirtualFileEvent(VirtualFileEventMetadataOnlySet, presence, nil))
+	}
+	return presence, err
 }
 
 func (m *model) VirtualFilePresence(folder, file string) (FilePresence, error) {
@@ -317,35 +380,20 @@ func (m *model) VirtualFilePresence(folder, file string) (FilePresence, error) {
 		return FilePresence{}, ErrFolderMissing
 	}
 
-	m.mut.RLock()
-	backend := m.contentBackend
-	m.mut.RUnlock()
-	if backend == nil {
-		backend = newContentBackend()
-	}
+	backend := m.currentContentBackend()
 
 	fi, ok, err := m.sdb.GetDeviceFile(folder, protocol.LocalDeviceID, name)
 	if err != nil {
 		return FilePresence{}, err
 	}
 	if ok && !fi.IsDeleted() {
-		return FilePresence{
-			Folder:  folder,
-			File:    name,
-			State:   backend.PresenceForFile(cfg, fi),
-			Backend: backend.BackendType(),
-		}, nil
+		return newFilePresence(folder, name, backend.PresenceForFile(cfg, fi), backend), nil
 	}
 
 	if metadataOnly, err := m.isMetadataOnly(folder, name); err != nil {
 		return FilePresence{}, err
 	} else if metadataOnly {
-		return FilePresence{
-			Folder:  folder,
-			File:    name,
-			State:   MetadataOnly,
-			Backend: backend.BackendType(),
-		}, nil
+		return newFilePresence(folder, name, MetadataOnly, backend), nil
 	}
 
 	return FilePresence{}, protocol.ErrNoSuchFile

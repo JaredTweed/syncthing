@@ -153,8 +153,13 @@ type testModel struct {
 
 func newModel(t testing.TB, cfg config.Wrapper, id protocol.DeviceID, protectedFiles []string) *testModel {
 	t.Helper()
+	return newModelWithDBDir(t, cfg, id, protectedFiles, t.TempDir())
+}
+
+func newModelWithDBDir(t testing.TB, cfg config.Wrapper, id protocol.DeviceID, protectedFiles []string, dbDir string) *testModel {
+	t.Helper()
 	evLogger := events.NewLogger()
-	mdb, err := sqlite.Open(t.TempDir())
+	mdb, err := sqlite.Open(dbDir)
 	if err != nil {
 		t.Fatal(err)
 	}

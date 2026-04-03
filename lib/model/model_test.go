@@ -202,15 +202,15 @@ func TestMetadataOnlyPlaceholderRemovesNeedAndPulling(t *testing.T) {
 	}
 
 	file := protocol.FileInfo{
-		Name:        "placeholder.txt",
-		Type:        protocol.FileInfoTypeFile,
-		Size:        int64(len(data)),
-		ModifiedS:   time.Now().Unix(),
-		Permissions: 0o644,
+		Name:         "placeholder.txt",
+		Type:         protocol.FileInfoTypeFile,
+		Size:         int64(len(data)),
+		ModifiedS:    time.Now().Unix(),
+		Permissions:  0o644,
 		RawBlockSize: int32(blockSize),
-		Blocks:      blocks,
-		Version:     protocol.Vector{}.Update(device1.Short()),
-		Sequence:    1,
+		Blocks:       blocks,
+		Version:      protocol.Vector{}.Update(device1.Short()),
+		Sequence:     1,
 	}
 	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(file)}); err != nil {
 		t.Fatal(err)
@@ -307,6 +307,363 @@ func TestSetMetadataOnlyRequiresExperimentalFlag(t *testing.T) {
 
 	if _, err := m.SetMetadataOnly(fcfg.ID, file.Name); !errors.Is(err, ErrExperimentalVirtualFilesDisabled) {
 		t.Fatalf("expected ErrExperimentalVirtualFilesDisabled, got %v", err)
+	}
+}
+
+func TestFetchVirtualFileMaterializesMetadataOnlyPlaceholder(t *testing.T) {
+	wrapper, fcfg := newDefaultCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m, fc := setupModelWithConnectionFromWrapper(t, wrapper)
+	defer cleanupModel(m)
+
+	data := []byte("lazy fetch content")
+	fc.addFile("lazy.txt", 0o644, protocol.FileInfoTypeFile, data)
+	fc.sendIndexUpdate()
+
+	if _, err := m.SetMetadataOnly(fcfg.ID, "lazy.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	presence, err := m.FetchVirtualFile(context.Background(), fcfg.ID, "lazy.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presence.State != FullLocal {
+		t.Fatalf("expected FullLocal after fetch, got %+v", presence)
+	}
+	if presence.ContentAddressableBackend != "localNoop" || presence.ContentAddressableEnabled {
+		t.Fatalf("unexpected content-addressed backend payload: %+v", presence)
+	}
+
+	fd, err := fcfg.Filesystem().Open("lazy.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fd.Close()
+
+	bs, err := io.ReadAll(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(bs, data) {
+		t.Fatalf("unexpected fetched file contents: %q", string(bs))
+	}
+
+	if metadataOnly, err := m.isMetadataOnly(fcfg.ID, "lazy.txt"); err != nil {
+		t.Fatal(err)
+	} else if metadataOnly {
+		t.Fatal("expected metadata-only state to be cleared after fetch")
+	}
+
+	need, err := m.NeedSize(fcfg.ID, protocol.LocalDeviceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if need.TotalItems() != 0 || need.Bytes != 0 {
+		t.Fatalf("expected no remaining need after explicit fetch, got %+v", need)
+	}
+}
+
+func TestFetchVirtualFileUnavailableContentFailsSafely(t *testing.T) {
+	wrapper, fcfg := newDefaultCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	data := []byte("unavailable")
+	blockSize := protocol.BlockSize(int64(len(data)))
+	blocks, err := scanner.Blocks(context.Background(), bytes.NewReader(data), blockSize, int64(len(data)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	file := protocol.FileInfo{
+		Name:         "unavailable.txt",
+		Type:         protocol.FileInfoTypeFile,
+		Size:         int64(len(data)),
+		ModifiedS:    time.Now().Unix(),
+		Permissions:  0o644,
+		RawBlockSize: int32(blockSize),
+		Blocks:       blocks,
+		Version:      protocol.Vector{}.Update(device1.Short()),
+		Sequence:     1,
+	}
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(file)}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.SetMetadataOnly(fcfg.ID, file.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.FetchVirtualFile(context.Background(), fcfg.ID, file.Name); !errors.Is(err, ErrVirtualFileContentUnavailable) {
+		t.Fatalf("expected ErrVirtualFileContentUnavailable, got %v", err)
+	}
+
+	presence, err := m.VirtualFilePresence(fcfg.ID, file.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presence.State != MetadataOnly {
+		t.Fatalf("expected placeholder to remain metadata-only after failed fetch, got %+v", presence)
+	}
+
+	if _, err := fcfg.Filesystem().Lstat(file.Name); !fs.IsNotExist(err) {
+		t.Fatalf("expected no file to be materialized on failed fetch, got err=%v", err)
+	}
+}
+
+func TestLocalUpdateClearsMetadataOnlyPlaceholder(t *testing.T) {
+	wrapper, fcfg := newDefaultCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	data := []byte("scanner clears placeholder")
+	blockSize := protocol.BlockSize(int64(len(data)))
+	blocks, err := scanner.Blocks(context.Background(), bytes.NewReader(data), blockSize, int64(len(data)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	file := protocol.FileInfo{
+		Name:         "scanned.txt",
+		Type:         protocol.FileInfoTypeFile,
+		Size:         int64(len(data)),
+		ModifiedS:    time.Now().Unix(),
+		Permissions:  0o644,
+		RawBlockSize: int32(blockSize),
+		Blocks:       blocks,
+		Version:      protocol.Vector{}.Update(device1.Short()),
+		Sequence:     1,
+	}
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(file)}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.SetMetadataOnly(fcfg.ID, file.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	writeFile(t, fcfg.Filesystem(), file.Name, data)
+	if err := m.ScanFolder(fcfg.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	presence, err := m.VirtualFilePresence(fcfg.ID, file.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presence.State != FullLocal {
+		t.Fatalf("expected local scan to clear placeholder state, got %+v", presence)
+	}
+
+	if metadataOnly, err := m.isMetadataOnly(fcfg.ID, file.Name); err != nil {
+		t.Fatal(err)
+	} else if metadataOnly {
+		t.Fatal("expected stale placeholder record to be removed by local scan")
+	}
+}
+
+func TestVirtualFileMetadataOnlyPersistsAcrossModelRestart(t *testing.T) {
+	wrapper, fcfg := newDefaultCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	dbDir := t.TempDir()
+	m := newModelWithDBDir(t, wrapper, myID, nil, dbDir)
+	m.ServeBackground()
+	if err := m.ScanFolder(fcfg.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	data := []byte("persistent metadata")
+	blockSize := protocol.BlockSize(int64(len(data)))
+	blocks, err := scanner.Blocks(context.Background(), bytes.NewReader(data), blockSize, int64(len(data)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := protocol.FileInfo{
+		Name:         "persisted.txt",
+		Type:         protocol.FileInfoTypeFile,
+		Size:         int64(len(data)),
+		ModifiedS:    time.Now().Unix(),
+		Permissions:  0o644,
+		RawBlockSize: int32(blockSize),
+		Blocks:       blocks,
+		Version:      protocol.Vector{}.Update(device1.Short()),
+		Sequence:     1,
+	}
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(file)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.SetMetadataOnly(fcfg.ID, file.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupModel(m)
+
+	m2 := newModelWithDBDir(t, wrapper, myID, nil, dbDir)
+	m2.ServeBackground()
+	if err := m2.ScanFolder(fcfg.ID); err != nil {
+		t.Fatal(err)
+	}
+	defer cleanupModel(m2)
+
+	presence, err := m2.VirtualFilePresence(fcfg.ID, file.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presence.State != MetadataOnly {
+		t.Fatalf("expected metadata-only state to survive restart, got %+v", presence)
+	}
+}
+
+func TestVirtualFileCorruptMetadataFailsSafely(t *testing.T) {
+	wrapper, fcfg := newDefaultCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	if err := m.virtualFileRecordStore(fcfg.ID).PutBytes("broken.txt", []byte("{broken")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.VirtualFilePresence(fcfg.ID, "broken.txt"); err == nil {
+		t.Fatal("expected corrupt virtual-file metadata to return an error")
+	}
+	if _, err := m.FetchVirtualFile(context.Background(), fcfg.ID, "broken.txt"); err == nil {
+		t.Fatal("expected corrupt virtual-file metadata to fail fetch")
+	}
+}
+
+func TestVirtualFileValidationErrors(t *testing.T) {
+	wrapper, fcfg := newDefaultCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	if _, err := m.SetMetadataOnly("missing", "foo"); !errors.Is(err, ErrFolderMissing) {
+		t.Fatalf("expected ErrFolderMissing from SetMetadataOnly, got %v", err)
+	}
+	if _, err := m.FetchVirtualFile(context.Background(), "missing", "foo"); !errors.Is(err, ErrFolderMissing) {
+		t.Fatalf("expected ErrFolderMissing from FetchVirtualFile, got %v", err)
+	}
+	if _, err := m.SetMetadataOnly(fcfg.ID, "../bad"); !errors.Is(err, protocol.ErrInvalid) {
+		t.Fatalf("expected protocol.ErrInvalid from SetMetadataOnly, got %v", err)
+	}
+	if _, err := m.FetchVirtualFile(context.Background(), fcfg.ID, "../bad"); !errors.Is(err, protocol.ErrInvalid) {
+		t.Fatalf("expected protocol.ErrInvalid from FetchVirtualFile, got %v", err)
+	}
+}
+
+type virtualFileHookRecorder struct {
+	mut    sync.Mutex
+	events []VirtualFileEvent
+}
+
+func (r *virtualFileHookRecorder) HandleVirtualFileEvent(event VirtualFileEvent) {
+	r.mut.Lock()
+	r.events = append(r.events, event)
+	r.mut.Unlock()
+}
+
+func (r *virtualFileHookRecorder) snapshot() []VirtualFileEvent {
+	r.mut.Lock()
+	defer r.mut.Unlock()
+	return append([]VirtualFileEvent(nil), r.events...)
+}
+
+func TestVirtualFileHooksReceiveLifecycleEvents(t *testing.T) {
+	wrapper, fcfg := newDefaultCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m, fc := setupModelWithConnectionFromWrapper(t, wrapper)
+	defer cleanupModel(m)
+
+	data := []byte("hooked fetch")
+	fc.addFile("hooked.txt", 0o644, protocol.FileInfoTypeFile, data)
+	fc.sendIndexUpdate()
+
+	recorder := &virtualFileHookRecorder{}
+	unregister := m.RegisterVirtualFilesystemHook(recorder)
+	defer unregister()
+
+	if _, err := m.SetMetadataOnly(fcfg.ID, "hooked.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.FetchVirtualFile(context.Background(), fcfg.ID, "hooked.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	events := recorder.snapshot()
+	if len(events) != 4 {
+		t.Fatalf("expected 4 hook events, got %d: %+v", len(events), events)
+	}
+
+	types := []VirtualFileEventType{
+		events[0].Type,
+		events[1].Type,
+		events[2].Type,
+		events[3].Type,
+	}
+	expected := []VirtualFileEventType{
+		VirtualFileEventMetadataOnlySet,
+		VirtualFileEventFetchStarted,
+		VirtualFileEventPresenceChanged,
+		VirtualFileEventFetchCompleted,
+	}
+	if !slices.Equal(types, expected) {
+		t.Fatalf("unexpected hook event order: got %v want %v", types, expected)
+	}
+	if events[2].State != FullLocal || events[3].State != FullLocal {
+		t.Fatalf("expected FullLocal events after fetch, got %+v", events)
 	}
 }
 

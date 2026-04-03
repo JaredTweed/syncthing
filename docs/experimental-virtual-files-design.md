@@ -145,13 +145,33 @@ Phase 2 implementation notes:
 - Route fetch/materialization through the content backend seam.
 - Keep implicit background behavior unchanged unless explicitly requested.
 
+Phase 3 implementation notes:
+
+- Explicit fetch is exposed as `POST /rest/debug/virtual-file/fetch?folder=<id>&file=<path>`.
+- The fetch path is still fully feature-gated by `experimentalVirtualFiles`.
+- Only the explicitly requested metadata-only file is materialized; the normal background pull queue remains unchanged.
+- The default backend reuses Syncthing's existing block request and hash verification logic, writes a temp file, renames it into place, updates the local index, and clears the metadata-only record on success.
+- Failures leave the metadata-only record in place and do not create an OS-visible placeholder file.
+
 ### Phase 4: Desktop Virtual Filesystem Integration Hooks
 
 - Add hooks for platform-specific virtual filesystem adapters.
 - Expose enough metadata and fetch APIs to support desktop integration without embedding OS-specific code into the core sync model.
+
+Phase 4 implementation notes:
+
+- Desktop integration is represented by an internal `VirtualFilesystemHook` interface and `VirtualFileEvent` lifecycle callbacks.
+- The current hooks report placeholder creation, explicit fetch start/completion/failure, and placeholder clearing when a real local file update supersedes a placeholder.
+- No platform-specific filesystem driver, kernel integration, or OS placeholder exposure is included in this phase.
 
 ### Phase 5: Optional Content-Addressed Backend Interface
 
 - Extend the backend abstraction for object references and content-addressed storage.
 - Keep IPFS or similar systems optional and pluggable.
 - Avoid introducing any hard dependency into the default Syncthing build.
+
+Phase 5 implementation notes:
+
+- A `ContentAddressableBackend` interface now exists alongside the main content backend seam.
+- The default implementation is a local no-op backend (`localNoop`) that reports content addressing as unsupported and adds no mandatory dependencies.
+- The debug virtual-file responses expose the current content backend type and the content-addressed backend capability so future adapters can be validated without changing the wire protocol.
