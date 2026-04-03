@@ -1786,10 +1786,69 @@ func (f *sendReceiveFolder) materializeVirtualFile(ctx context.Context, file pro
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if _, casErr := f.model.storeVirtualFileContentInContentAddressable(ctx, f.FolderConfiguration, file, f.mtimefs, tempName); casErr != nil {
+		f.sl.WarnContext(ctx, "Failed to store virtual file in local CAS", slogutil.FilePath(file.Name), slogutil.Error(casErr))
+	}
 	if err := f.finishVirtualFileMaterialization(file, tempName); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (f *sendReceiveFolder) materializeVirtualFileFromReader(ctx context.Context, file protocol.FileInfo, src io.Reader) (err error) {
+	if file.IsDeleted() || file.Type != protocol.FileInfoTypeFile {
+		return ErrVirtualFileNotSupported
+	}
+
+	if _, statErr := f.mtimefs.Lstat(file.Name); statErr == nil || fs.IsErrCaseConflict(statErr) {
+		f.ScheduleForceRescan(file.Name)
+		return ErrVirtualFileAlreadyLocal
+	} else if !fs.IsNotExist(statErr) {
+		return statErr
+	}
+
+	if err := f.checkVirtualFileParent(file.Name); err != nil {
+		return err
+	}
+
+	if err := f.CheckAvailableSpace(uint64(file.Size)); err != nil { //nolint:gosec
+		return err
+	}
+
+	tempName := fs.TempName(file.Name)
+	_ = f.inWritableDir(f.mtimefs.Remove, tempName)
+	defer func() {
+		if err != nil {
+			_ = f.inWritableDir(f.mtimefs.Remove, tempName)
+		}
+	}()
+
+	fd, err := f.mtimefs.OpenFile(tempName, fs.OptReadWrite|fs.OptCreate|fs.OptExclusive|fs.OptTruncate, 0o600)
+	if err != nil {
+		return err
+	}
+
+	written, copyErr := copyWithContext(ctx, fd, src)
+	syncErr := fd.Sync()
+	closeErr := fd.Close()
+	switch {
+	case copyErr != nil:
+		return copyErr
+	case syncErr != nil:
+		return syncErr
+	case closeErr != nil:
+		return closeErr
+	case written != file.Size:
+		return ErrContentAddressableCorrupt
+	}
+
+	if err := f.verifyVirtualFileTempContent(ctx, tempName, file); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return f.finishVirtualFileMaterialization(file, tempName)
 }
 
 func (f *sendReceiveFolder) checkVirtualFileParent(file string) error {
@@ -1869,6 +1928,29 @@ func (f *sendReceiveFolder) ensureVirtualFileMaterializationCurrent(file protoco
 		return ErrVirtualFileStale
 	}
 	return nil
+}
+
+func (f *sendReceiveFolder) verifyVirtualFileTempContent(ctx context.Context, tempName string, file protocol.FileInfo) error {
+	blocks, err := scanner.HashFile(ctx, f.ID, f.mtimefs, tempName, file.BlockSize(), nil)
+	if err != nil {
+		return err
+	}
+	if !virtualFileBlocksEqual(blocks, file.Blocks) {
+		return ErrContentAddressableCorrupt
+	}
+	return nil
+}
+
+func virtualFileBlocksEqual(a, b []protocol.BlockInfo) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Offset != b[i].Offset || a[i].Size != b[i].Size || !bytes.Equal(a[i].Hash, b[i].Hash) {
+			return false
+		}
+	}
+	return true
 }
 
 func (f *sendReceiveFolder) Jobs(page, perpage int) ([]string, []string, int) {

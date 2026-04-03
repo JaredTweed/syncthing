@@ -180,7 +180,32 @@ Phase 4 implementation notes:
 Phase 5 implementation notes:
 
 - A `ContentAddressableBackend` interface now exists alongside the main content backend seam.
-- The default implementation is a local no-op backend (`localNoop`) that reports content addressing as unsupported and adds no mandatory dependencies.
+- The first real implementation is a local, Syncthing-managed CAS store rooted beside Syncthing's SQLite database, with file references and GC hints stored in the metadata DB.
+- Object layout:
+  - `<db dir>/virtualfiles-cas/objects/<sha256-prefix>/<sha256>` stores the raw object bytes on disk
+  - `virtualfiles/cas/object-meta/<sha256>` in the DB KV store holds object metadata and a reference-count hint
+  - `virtualfiles/cas/file-refs/<folder>/<file>` in the DB KV store holds the current file-to-object association for the matching global file content
+- Digest/address format:
+  - `ContentAddressableReference{Scheme:"sha256", Key:<hex sha256 of full file bytes>, Size:<file size>}`
+  - file references additionally record the expected block hash and file size so stale references can be rejected before use
+- Write path:
+  - remote explicit fetch still downloads into a staged temp file and verifies blocks using the existing Syncthing pull path
+  - once the staged temp is complete, the bytes are hashed into a `sha256` address, streamed into local CAS, and the file reference is updated
+  - only after that does materialization publish the final file through the existing no-overwrite path
+- Read path:
+  - explicit fetch first asks the CAS backend whether the current global file already has a valid local object reference
+  - if so, the object is streamed out of CAS into a staged temp file, rehashed against the current block list, and then published through the same conservative materialization path
+  - if the CAS object is missing or corrupt, the reference is treated as stale and fetch falls back to the normal remote block fetch path
+- Reference tracking:
+  - the file-reference store is the first live-reference scaffold for future GC
+  - object metadata stores a best-effort reference-count hint so a later GC pass can identify apparently unreferenced objects without changing the object format
+  - full GC is intentionally deferred; Phase 5 only provides the bookkeeping seams
+- Failure handling:
+  - digest mismatch on CAS read/write is treated as corruption and never published to the folder filesystem
+  - missing or stale CAS references are self-healed by dropping the reference and falling back to remote fetch when possible
+  - CAS storage failure does not relax publish safety or introduce overwrite semantics; it only disables the acceleration path for that fetch
+- Future IPFS adapter boundary:
+  - a future non-local adapter should implement the same `ContentAddressableBackend` contract while leaving file-reference validation, placeholder state, and conservative final publish semantics unchanged
 - The debug virtual-file responses expose the current content backend type and the content-addressed backend capability so future adapters can be validated without changing the wire protocol.
 
 ## Hardening Notes

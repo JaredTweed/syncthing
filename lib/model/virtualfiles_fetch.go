@@ -10,8 +10,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
@@ -26,6 +28,10 @@ var afterVirtualFileMaterializeHook func(folder, file string)
 
 type virtualFileMaterializer interface {
 	materializeVirtualFile(ctx context.Context, file protocol.FileInfo) error
+}
+
+type virtualFileReaderMaterializer interface {
+	materializeVirtualFileFromReader(ctx context.Context, file protocol.FileInfo, src io.Reader) error
 }
 
 type virtualFileLocalUpdater interface {
@@ -143,6 +149,62 @@ func (m *model) materializeLocalFile(ctx context.Context, folder config.FolderCo
 	}
 
 	return nil
+}
+
+func (m *model) materializeLocalFileFromContentAddressable(ctx context.Context, folder config.FolderConfiguration, file protocol.FileInfo, ref ContentAddressableReference) error {
+	m.mut.RLock()
+	runner, ok := m.folderRunners.Get(folder.ID)
+	m.mut.RUnlock()
+	if !ok {
+		return ErrFolderNotRunning
+	}
+
+	materializer, ok := runner.(virtualFileReaderMaterializer)
+	if !ok {
+		return ErrVirtualFileFetchUnsupported
+	}
+
+	casBackend := m.currentContentBackend().ContentAddressableBackend()
+	if casBackend == nil || !casBackend.SupportsContentAddressing() {
+		return ErrContentAddressableBackendUnavailable
+	}
+
+	rc, err := casBackend.Get(ctx, ref)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	return materializer.materializeVirtualFileFromReader(ctx, file, rc)
+}
+
+func (m *model) storeVirtualFileContentInContentAddressable(ctx context.Context, folder config.FolderConfiguration, file protocol.FileInfo, filesystem fs.Filesystem, name string) (*ContentAddressableReference, error) {
+	casBackend := m.currentContentBackend().ContentAddressableBackend()
+	if casBackend == nil || !casBackend.SupportsContentAddressing() {
+		return nil, nil
+	}
+
+	ref, err := contentAddressableReferenceFromFile(ctx, filesystem, name)
+	if err != nil {
+		return nil, err
+	}
+
+	fd, err := filesystem.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer fd.Close()
+
+	if err := casBackend.Put(ctx, ref, fd); err != nil {
+		return nil, err
+	}
+	if err := casBackend.AssociateFile(folder, file, ref); err != nil {
+		return nil, err
+	}
+	if err := m.updateVirtualFileContentRef(folder.ID, file.Name, &ref); err != nil {
+		return nil, err
+	}
+	return &ref, nil
 }
 
 func (m *model) promoteMaterializedVirtualFile(folder config.FolderConfiguration, file protocol.FileInfo) error {

@@ -408,7 +408,7 @@ func TestFetchVirtualFileMaterializesMetadataOnlyPlaceholder(t *testing.T) {
 	if presence.State != FullLocal {
 		t.Fatalf("expected FullLocal after fetch, got %+v", presence)
 	}
-	if presence.ContentAddressableBackend != "localNoop" || presence.ContentAddressableEnabled {
+	if presence.ContentAddressableBackend != "localCAS" || !presence.ContentAddressableEnabled {
 		t.Fatalf("unexpected content-addressed backend payload: %+v", presence)
 	}
 
@@ -438,6 +438,357 @@ func TestFetchVirtualFileMaterializesMetadataOnlyPlaceholder(t *testing.T) {
 	}
 	if need.TotalItems() != 0 || need.Bytes != 0 {
 		t.Fatalf("expected no remaining need after explicit fetch, got %+v", need)
+	}
+
+	if ref, ok, err := currentLocalCASBackend(t, m).ReferenceForFile(fcfg, fc.files[0]); err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected fetched file to be stored in local CAS")
+	} else if ref.Size != int64(len(data)) {
+		t.Fatalf("unexpected CAS reference after fetch: %+v", ref)
+	}
+}
+
+func TestLocalContentAddressableBackendPutGet(t *testing.T) {
+	wrapper, _ := newDefaultBasicCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	cas := currentLocalCASBackend(t, m)
+	data := []byte("local cas object payload")
+	ref := contentAddressableReferenceForBytes(data)
+
+	if err := cas.Put(context.Background(), ref, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+
+	rc, err := cas.Get(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("unexpected CAS payload %q", got)
+	}
+}
+
+func TestLocalContentAddressableBackendDigestMismatchFails(t *testing.T) {
+	wrapper, _ := newDefaultBasicCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	ref := contentAddressableReferenceForBytes([]byte("expected bytes"))
+	if err := currentLocalCASBackend(t, m).Put(context.Background(), ref, bytes.NewReader([]byte("different"))); !errors.Is(err, ErrContentAddressableDigestMismatch) {
+		t.Fatalf("expected digest mismatch, got %v", err)
+	}
+}
+
+func TestSetMetadataOnlyReferencesExistingLocalCASContent(t *testing.T) {
+	wrapper, fcfg := newDefaultBasicCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m, fc := setupModelWithConnectionFromWrapper(t, wrapper)
+	defer cleanupModel(m)
+
+	data := []byte("metadata only from cas")
+	fc.addFile("casref.txt", 0o644, protocol.FileInfoTypeFile, data)
+	file := fc.files[0]
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(file)}); err != nil {
+		t.Fatal(err)
+	}
+
+	cas := currentLocalCASBackend(t, m)
+	ref := contentAddressableReferenceForBytes(data)
+	if err := cas.Put(context.Background(), ref, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	if err := cas.AssociateFile(fcfg, file, ref); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.SetMetadataOnly(fcfg.ID, file.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	record, ok, err := m.virtualFileRecord(fcfg.ID, file.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || record.ContentRef == nil {
+		t.Fatal("expected metadata-only record to retain CAS reference")
+	}
+	if !contentAddressableReferenceEqual(*record.ContentRef, ref) {
+		t.Fatalf("unexpected CAS ref on metadata-only record: %+v", record.ContentRef)
+	}
+}
+
+func TestFetchVirtualFileUsesExistingCASContentWithoutRedownload(t *testing.T) {
+	wrapper, fcfg := newDefaultBasicCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m, fc := setupModelWithConnectionFromWrapper(t, wrapper)
+	defer cleanupModel(m)
+
+	data := []byte("fetch directly from local cas")
+	fc.addFile("cached.txt", 0o644, protocol.FileInfoTypeFile, data)
+	file := fc.files[0]
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(file)}); err != nil {
+		t.Fatal(err)
+	}
+
+	cas := currentLocalCASBackend(t, m)
+	ref := contentAddressableReferenceForBytes(data)
+	if err := cas.Put(context.Background(), ref, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	if err := cas.AssociateFile(fcfg, file, ref); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.SetMetadataOnly(fcfg.ID, file.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	fc.RequestCalls(func(context.Context, *protocol.Request) ([]byte, error) {
+		t.Fatal("CAS-backed fetch should not request remote blocks")
+		return nil, nil
+	})
+
+	presence, err := m.FetchVirtualFile(context.Background(), fcfg.ID, file.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presence.State != FullLocal {
+		t.Fatalf("expected FullLocal after CAS fetch, got %+v", presence)
+	}
+	if fc.RequestCallCount() != 0 {
+		t.Fatalf("expected no remote block requests, got %d", fc.RequestCallCount())
+	}
+
+	fd, err := fcfg.Filesystem().Open(file.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fd.Close()
+	got, err := io.ReadAll(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("unexpected CAS materialized contents %q", got)
+	}
+}
+
+func TestFetchVirtualFileFallsBackWhenCASObjectMissing(t *testing.T) {
+	wrapper, fcfg := newDefaultBasicCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m, fc := setupModelWithConnectionFromWrapper(t, wrapper)
+	defer cleanupModel(m)
+
+	data := []byte("remote after missing cas")
+	fc.addFile("missingcas.txt", 0o644, protocol.FileInfoTypeFile, data)
+	file := fc.files[0]
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(file)}); err != nil {
+		t.Fatal(err)
+	}
+
+	cas := currentLocalCASBackend(t, m)
+	ref := contentAddressableReferenceForBytes(data)
+	if err := cas.Put(context.Background(), ref, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	if err := cas.AssociateFile(fcfg, file, ref); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(cas.objectPath(ref)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.SetMetadataOnly(fcfg.ID, file.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeRequests := fc.RequestCallCount()
+	if _, err := m.FetchVirtualFile(context.Background(), fcfg.ID, file.Name); err != nil {
+		t.Fatal(err)
+	}
+	if fc.RequestCallCount() <= beforeRequests {
+		t.Fatal("expected remote fallback after missing CAS object")
+	}
+
+	if gotRef, ok, err := cas.ReferenceForFile(fcfg, file); err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("expected CAS association to be restored after remote fallback")
+	} else if !contentAddressableReferenceEqual(gotRef, ref) {
+		t.Fatalf("unexpected restored CAS ref: %+v", gotRef)
+	}
+}
+
+func TestFetchVirtualFileFallsBackWhenCASObjectCorrupt(t *testing.T) {
+	wrapper, fcfg := newDefaultBasicCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m, fc := setupModelWithConnectionFromWrapper(t, wrapper)
+	defer cleanupModel(m)
+
+	data := []byte("remote after corrupt cas")
+	fc.addFile("corruptcas.txt", 0o644, protocol.FileInfoTypeFile, data)
+	file := fc.files[0]
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(file)}); err != nil {
+		t.Fatal(err)
+	}
+
+	cas := currentLocalCASBackend(t, m)
+	ref := contentAddressableReferenceForBytes(data)
+	if err := cas.Put(context.Background(), ref, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	if err := cas.AssociateFile(fcfg, file, ref); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cas.objectPath(ref), []byte(strings.Repeat("x", len(data))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.SetMetadataOnly(fcfg.ID, file.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeRequests := fc.RequestCallCount()
+	if _, err := m.FetchVirtualFile(context.Background(), fcfg.ID, file.Name); err != nil {
+		t.Fatal(err)
+	}
+	if fc.RequestCallCount() <= beforeRequests {
+		t.Fatal("expected remote fallback after corrupt CAS object")
+	}
+}
+
+func TestVirtualFileContentAddressableStatePersistsAcrossRestart(t *testing.T) {
+	wrapper, fcfg := newDefaultBasicCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	dbDir := t.TempDir()
+	m := newModelWithDBDir(t, wrapper, myID, nil, dbDir)
+	m.ServeBackground()
+	if err := m.ScanFolder(fcfg.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	data := []byte("restart from local cas")
+	blockSize := protocol.BlockSize(int64(len(data)))
+	blocks, err := scanner.Blocks(context.Background(), bytes.NewReader(data), blockSize, int64(len(data)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := protocol.FileInfo{
+		Name:         "casrestart.txt",
+		Type:         protocol.FileInfoTypeFile,
+		Size:         int64(len(data)),
+		ModifiedS:    time.Now().Unix(),
+		Permissions:  0o644,
+		RawBlockSize: int32(blockSize),
+		Blocks:       blocks,
+		Version:      protocol.Vector{}.Update(device1.Short()),
+		Sequence:     1,
+	}
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(file)}); err != nil {
+		t.Fatal(err)
+	}
+
+	cas := currentLocalCASBackend(t, m)
+	ref := contentAddressableReferenceForBytes(data)
+	if err := cas.Put(context.Background(), ref, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	if err := cas.AssociateFile(fcfg, file, ref); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.SetMetadataOnly(fcfg.ID, file.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupModel(m)
+
+	m2 := newModelWithDBDir(t, wrapper, myID, nil, dbDir)
+	m2.ServeBackground()
+	if err := m2.ScanFolder(fcfg.ID); err != nil {
+		t.Fatal(err)
+	}
+	defer cleanupModel(m2)
+
+	presence, err := m2.FetchVirtualFile(context.Background(), fcfg.ID, file.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presence.State != FullLocal {
+		t.Fatalf("expected FullLocal after restart CAS fetch, got %+v", presence)
+	}
+
+	fd, err := fcfg.Filesystem().Open(file.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fd.Close()
+	got, err := io.ReadAll(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("unexpected restart CAS materialization %q", got)
 	}
 }
 

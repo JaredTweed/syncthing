@@ -227,6 +227,21 @@ func cleanupModelAndRemoveDir(m *testModel, dir string) {
 	os.RemoveAll(dir)
 }
 
+func currentLocalCASBackend(t testing.TB, m *testModel) *localContentAddressableBackend {
+	t.Helper()
+
+	backend := m.currentContentBackend()
+	if backend == nil {
+		t.Fatal("expected content backend")
+	}
+	casBackend := backend.ContentAddressableBackend()
+	cas, ok := casBackend.(*localContentAddressableBackend)
+	if !ok {
+		t.Fatalf("expected local CAS backend, got %T", casBackend)
+	}
+	return cas
+}
+
 type alwaysChangedKey struct {
 	fs   fs.Filesystem
 	name string

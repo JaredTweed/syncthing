@@ -149,6 +149,10 @@ func (s *DB) Close() error {
 	return wrap(s.baseDB.Close())
 }
 
+func (s *DB) PathBase() string {
+	return s.pathBase
+}
+
 func initTmpDir(path string) {
 	if build.IsWindows || build.IsDarwin || os.Getenv("SQLITE_TMPDIR") != "" {
 		// Doesn't use SQLITE_TMPDIR, isn't likely to have a tiny

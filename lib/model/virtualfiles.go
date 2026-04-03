@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/syncthing/syncthing/internal/db"
@@ -76,26 +77,31 @@ type ContentBackend interface {
 	ContentAddressableBackend() ContentAddressableBackend
 }
 
-type localFilesystemContentBackend struct{}
+type localFilesystemContentBackend struct {
+	model   *model
+	casOnce sync.Once
+	cas     ContentAddressableBackend
+}
 
 type virtualFileRecord struct {
-	State   PresenceState `json:"state"`
-	Updated time.Time     `json:"updated"`
+	State      PresenceState                `json:"state"`
+	ContentRef *ContentAddressableReference `json:"contentRef,omitempty"`
+	Updated    time.Time                    `json:"updated"`
 }
 
-func newContentBackend() ContentBackend {
-	return localFilesystemContentBackend{}
+func newContentBackend(m *model) ContentBackend {
+	return &localFilesystemContentBackend{model: m}
 }
 
-func (localFilesystemContentBackend) BackendType() string {
+func (*localFilesystemContentBackend) BackendType() string {
 	return "localFilesystem"
 }
 
-func (localFilesystemContentBackend) PresenceForFile(_ config.FolderConfiguration, _ protocol.FileInfo) PresenceState {
+func (*localFilesystemContentBackend) PresenceForFile(_ config.FolderConfiguration, _ protocol.FileInfo) PresenceState {
 	return FullLocal
 }
 
-func (localFilesystemContentBackend) ReadAt(_ context.Context, folder config.FolderConfiguration, req ContentReadRequest, buf []byte) (int, error) {
+func (*localFilesystemContentBackend) ReadAt(_ context.Context, folder config.FolderConfiguration, req ContentReadRequest, buf []byte) (int, error) {
 	name := req.Name
 	if req.FromTemporary {
 		name = fs.TempName(name)
@@ -103,12 +109,40 @@ func (localFilesystemContentBackend) ReadAt(_ context.Context, folder config.Fol
 	return readOffsetIntoBuf(folder.Filesystem(), name, req.Offset, buf)
 }
 
-func (localFilesystemContentBackend) Materialize(ctx context.Context, m *model, folder config.FolderConfiguration, file protocol.FileInfo) error {
+func (b *localFilesystemContentBackend) Materialize(ctx context.Context, m *model, folder config.FolderConfiguration, file protocol.FileInfo) error {
+	casBackend := b.ContentAddressableBackend()
+	if casBackend != nil && casBackend.SupportsContentAddressing() {
+		if ref, ok, err := casBackend.ReferenceForFile(folder, file); err != nil {
+			return err
+		} else if ok {
+			if err := m.materializeLocalFileFromContentAddressable(ctx, folder, file, ref); err == nil {
+				return nil
+			} else if !errors.Is(err, ErrContentAddressableObjectMissing) && !errors.Is(err, ErrContentAddressableCorrupt) {
+				return err
+			}
+			if err := casBackend.ForgetFile(folder.ID, file.Name); err != nil {
+				return err
+			}
+			if err := m.updateVirtualFileContentRef(folder.ID, file.Name, nil); err != nil {
+				return err
+			}
+		}
+	}
+
 	return m.materializeLocalFile(ctx, folder, file)
 }
 
-func (localFilesystemContentBackend) ContentAddressableBackend() ContentAddressableBackend {
-	return noopContentAddressableBackend{}
+func (b *localFilesystemContentBackend) ContentAddressableBackend() ContentAddressableBackend {
+	if b == nil || b.model == nil || !b.model.experimentalVirtualFilesEnabled() {
+		return noopContentAddressableBackend{}
+	}
+	b.casOnce.Do(func() {
+		b.cas = newLocalContentAddressableBackend(b.model)
+	})
+	if b.cas == nil {
+		return noopContentAddressableBackend{}
+	}
+	return b.cas
 }
 
 func (m *model) experimentalVirtualFilesEnabled() bool {
@@ -120,14 +154,14 @@ func (m *model) currentContentBackend() ContentBackend {
 	backend := m.contentBackend
 	m.mut.RUnlock()
 	if backend == nil {
-		backend = newContentBackend()
+		backend = newContentBackend(m)
 	}
 	return backend
 }
 
 func newFilePresence(folder, file string, state PresenceState, backend ContentBackend) FilePresence {
 	if backend == nil {
-		backend = newContentBackend()
+		backend = newContentBackend(nil)
 	}
 
 	casBackend := backend.ContentAddressableBackend()
@@ -174,6 +208,14 @@ func (m *model) virtualFileRecord(folder, file string) (virtualFileRecord, bool,
 		return virtualFileRecord{}, false, err
 	}
 	return record, true, nil
+}
+
+func (m *model) putVirtualFileRecord(folder, file string, record virtualFileRecord) error {
+	bs, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	return m.virtualFileRecordStore(folder).PutBytes(file, bs)
 }
 
 func (m *model) virtualFileRecordNames(folder string) ([]string, error) {
@@ -433,11 +475,15 @@ func (m *model) SetMetadataOnly(folder, file string) (FilePresence, error) {
 		State:   MetadataOnly,
 		Updated: time.Now().UTC(),
 	}
-	bs, err := json.Marshal(record)
-	if err != nil {
-		return FilePresence{}, err
+	casBackend := m.currentContentBackend().ContentAddressableBackend()
+	if casBackend != nil && casBackend.SupportsContentAddressing() {
+		if ref, ok, err := casBackend.ReferenceForFile(cfg, global); err != nil {
+			return FilePresence{}, err
+		} else if ok {
+			record.ContentRef = &ref
+		}
 	}
-	if err := m.virtualFileRecordStore(folder).PutBytes(name, bs); err != nil {
+	if err := m.putVirtualFileRecord(folder, name, record); err != nil {
 		return FilePresence{}, err
 	}
 
@@ -498,4 +544,24 @@ func (m *model) pruneVirtualFilePresenceAfterRemoteUpdate(folder string, files [
 		}
 	}
 	return nil
+}
+
+func (m *model) updateVirtualFileContentRef(folder, file string, ref *ContentAddressableReference) error {
+	if !m.experimentalVirtualFilesEnabled() {
+		return nil
+	}
+
+	record, ok, err := m.virtualFileRecord(folder, file)
+	if err != nil || !ok {
+		return err
+	}
+
+	record.Updated = time.Now().UTC()
+	if ref == nil {
+		record.ContentRef = nil
+	} else {
+		refCopy := *ref
+		record.ContentRef = &refCopy
+	}
+	return m.putVirtualFileRecord(folder, file, record)
 }
