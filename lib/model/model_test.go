@@ -36,6 +36,7 @@ import (
 	"github.com/syncthing/syncthing/lib/protocol"
 	protocolmocks "github.com/syncthing/syncthing/lib/protocol/mocks"
 	srand "github.com/syncthing/syncthing/lib/rand"
+	"github.com/syncthing/syncthing/lib/scanner"
 	"github.com/syncthing/syncthing/lib/semaphore"
 	"github.com/syncthing/syncthing/lib/testutil"
 	"github.com/syncthing/syncthing/lib/versioner"
@@ -135,6 +136,177 @@ func TestRequest(t *testing.T) {
 	_, err = m.Request(device1Conn, &protocol.Request{Folder: "default", Name: "foo", Size: 42})
 	if err != nil {
 		t.Error("Unexpected error when large read should be permitted")
+	}
+}
+
+func TestRequestUnchangedWhenExperimentalVirtualFilesDisabled(t *testing.T) {
+	wrapper, fcfg := newDefaultCfgWrapper(t)
+	ffs := fcfg.Filesystem()
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = false
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	fd, err := ffs.Create("foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fd.Write([]byte("foobar")); err != nil {
+		t.Fatal(err)
+	}
+	fd.Close()
+
+	if err := m.ScanFolder("default"); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := m.Request(device1Conn, &protocol.Request{Folder: "default", Name: "foo", Size: 6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(res.Data(), []byte("foobar")) {
+		t.Fatalf("incorrect data from request: %q", string(res.Data()))
+	}
+}
+
+func TestMetadataOnlyPlaceholderRemovesNeedAndPulling(t *testing.T) {
+	wrapper, fcfg := newDefaultCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	fc := addFakeConn(m, device1, fcfg.ID)
+	fc.RequestCalls(func(context.Context, *protocol.Request) ([]byte, error) {
+		t.Fatal("metadata-only placeholder should not trigger a block request")
+		return nil, nil
+	})
+
+	data := []byte("metadata only contents")
+	blockSize := protocol.BlockSize(int64(len(data)))
+	blocks, err := scanner.Blocks(context.Background(), bytes.NewReader(data), blockSize, int64(len(data)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	file := protocol.FileInfo{
+		Name:        "placeholder.txt",
+		Type:        protocol.FileInfoTypeFile,
+		Size:        int64(len(data)),
+		ModifiedS:   time.Now().Unix(),
+		Permissions: 0o644,
+		RawBlockSize: int32(blockSize),
+		Blocks:      blocks,
+		Version:     protocol.Vector{}.Update(device1.Short()),
+		Sequence:    1,
+	}
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(file)}); err != nil {
+		t.Fatal(err)
+	}
+
+	need, err := m.NeedSize(fcfg.ID, protocol.LocalDeviceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if need.Files != 1 {
+		t.Fatalf("expected one needed file before metadata-only mark, got %+v", need)
+	}
+
+	presence, err := m.SetMetadataOnly(fcfg.ID, file.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presence.State != MetadataOnly {
+		t.Fatalf("expected MetadataOnly state, got %+v", presence)
+	}
+
+	need, err = m.NeedSize(fcfg.ID, protocol.LocalDeviceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if need.TotalItems() != 0 || need.Bytes != 0 {
+		t.Fatalf("expected no remaining effective need, got %+v", need)
+	}
+
+	progress, queued, rest, err := m.NeedFolderFiles(fcfg.ID, 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(progress) != 0 || len(queued) != 0 || len(rest) != 0 {
+		t.Fatalf("expected metadata-only file to be omitted from need lists, got progress=%d queued=%d rest=%d", len(progress), len(queued), len(rest))
+	}
+
+	if _, ok, err := m.CurrentFolderFile(fcfg.ID, file.Name); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatal("metadata-only placeholder must not create a local file record")
+	}
+
+	if _, err := fcfg.Filesystem().Lstat(file.Name); !fs.IsNotExist(err) {
+		t.Fatalf("metadata-only placeholder must not exist on the filesystem, got err=%v", err)
+	}
+
+	m.mut.RLock()
+	runner, ok := m.folderRunners.Get(fcfg.ID)
+	m.mut.RUnlock()
+	if !ok {
+		t.Fatal("expected running folder")
+	}
+	sr, ok := runner.(*sendReceiveFolder)
+	if !ok {
+		t.Fatal("expected sendReceiveFolder")
+	}
+
+	success, err := sr.pull(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !success {
+		t.Fatal("expected pull to report success with only metadata-only placeholders remaining")
+	}
+}
+
+func TestSetMetadataOnlyRequiresExperimentalFlag(t *testing.T) {
+	wrapper, fcfg := newDefaultCfgWrapper(t)
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	data := []byte("test")
+	blockSize := protocol.BlockSize(int64(len(data)))
+	blocks, err := scanner.Blocks(context.Background(), bytes.NewReader(data), blockSize, int64(len(data)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	file := protocol.FileInfo{
+		Name:         "placeholder-disabled.txt",
+		Type:         protocol.FileInfoTypeFile,
+		Size:         int64(len(data)),
+		ModifiedS:    time.Now().Unix(),
+		Permissions:  0o644,
+		RawBlockSize: int32(blockSize),
+		Blocks:       blocks,
+		Version:      protocol.Vector{}.Update(device1.Short()),
+		Sequence:     1,
+	}
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(file)}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.SetMetadataOnly(fcfg.ID, file.Name); !errors.Is(err, ErrExperimentalVirtualFilesDisabled) {
+		t.Fatalf("expected ErrExperimentalVirtualFilesDisabled, got %v", err)
 	}
 }
 

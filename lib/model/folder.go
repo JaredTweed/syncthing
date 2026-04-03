@@ -189,7 +189,7 @@ func (f *folder) Serve(ctx context.Context) error {
 				// actual pull. Only set the state to SyncWaiting if we have
 				// reason to believe there is something to sync, to avoid
 				// unnecessary flashing in the GUI.
-				if needCount, err := f.db.CountNeed(f.folderID, protocol.LocalDeviceID); err == nil && needCount.TotalItems() > 0 {
+				if needCount, err := f.model.NeedSize(f.folderID, protocol.LocalDeviceID); err == nil && needCount.TotalItems() > 0 {
 					f.setState(FolderSyncWaiting)
 				}
 				pullTimer.Reset(time.Duration(float64(time.Second) * f.PullerDelayS))
@@ -386,7 +386,7 @@ func (f *folder) pull(ctx context.Context) (success bool, err error) {
 	}()
 
 	// If there is nothing to do, don't even enter sync-waiting state.
-	needCount, err := f.db.CountNeed(f.folderID, protocol.LocalDeviceID)
+	needCount, err := f.model.NeedSize(f.folderID, protocol.LocalDeviceID)
 	if err != nil {
 		return false, err
 	}
@@ -1276,6 +1276,10 @@ func (f *folder) updateLocals(fs []protocol.FileInfo) error {
 		delete(f.forcedRescanPaths, file.Name)
 	}
 	f.forcedRescanPathsMut.Unlock()
+
+	if err := f.model.clearVirtualFilePresenceBatch(f.folderID, filenames); err != nil {
+		return err
+	}
 
 	seq, err := f.db.GetDeviceSequence(f.folderID, protocol.LocalDeviceID)
 	if err != nil {

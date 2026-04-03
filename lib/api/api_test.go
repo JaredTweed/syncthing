@@ -217,6 +217,25 @@ type httpTestCase struct {
 	Timeout time.Duration // Defaults to a second
 }
 
+type virtualFileAPITestModel struct {
+	*modelmocks.Model
+	presence  model.FilePresence
+	setErr    error
+	setCalled bool
+}
+
+func (m *virtualFileAPITestModel) VirtualFilePresence(folder, file string) (model.FilePresence, error) {
+	return m.presence, nil
+}
+
+func (m *virtualFileAPITestModel) SetMetadataOnly(folder, file string) (model.FilePresence, error) {
+	m.setCalled = true
+	if m.setErr != nil {
+		return model.FilePresence{}, m.setErr
+	}
+	return m.presence, nil
+}
+
 func TestAPIServiceRequests(t *testing.T) {
 	t.Parallel()
 
@@ -1031,11 +1050,18 @@ func TestApiCache(t *testing.T) {
 }
 
 func startHTTP(t *testing.T, cfg config.Wrapper) string {
-	return startHTTPWithShutdownTimeout(t, cfg, 0)
+	return startHTTPWithModelAndShutdownTimeout(t, cfg, new(modelmocks.Model), 0)
 }
 
 func startHTTPWithShutdownTimeout(t *testing.T, cfg config.Wrapper, shutdownTimeout time.Duration) string {
-	m := new(modelmocks.Model)
+	return startHTTPWithModelAndShutdownTimeout(t, cfg, new(modelmocks.Model), shutdownTimeout)
+}
+
+func startHTTPWithModel(t *testing.T, cfg config.Wrapper, m model.Model) string {
+	return startHTTPWithModelAndShutdownTimeout(t, cfg, m, 0)
+}
+
+func startHTTPWithModelAndShutdownTimeout(t *testing.T, cfg config.Wrapper, m model.Model, shutdownTimeout time.Duration) string {
 	assetDir := "../../gui"
 	eventSub := new(eventmocks.BufferedSubscription)
 	diskEventSub := new(eventmocks.BufferedSubscription)
@@ -1087,6 +1113,109 @@ func startHTTPWithShutdownTimeout(t *testing.T, cfg config.Wrapper, shutdownTime
 	baseURL := fmt.Sprintf("http://%s", net.JoinHostPort(host, strconv.Itoa(tcpAddr.Port)))
 
 	return baseURL
+}
+
+func TestDebugVirtualFilePresenceFullLocal(t *testing.T) {
+	t.Parallel()
+
+	cfg := newMockedConfig()
+	cfg.GUIReturns(config.GUIConfiguration{APIKey: testAPIKey, RawAddress: "127.0.0.1:0"})
+	cfg.OptionsReturns(config.OptionsConfiguration{ExperimentalVirtualFiles: false})
+
+	m := new(modelmocks.Model)
+	m.CurrentFolderFileReturns(protocol.FileInfo{Name: "foo", Type: protocol.FileInfoTypeFile}, true, nil)
+
+	baseURL := startHTTPWithModel(t, cfg, m)
+
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/rest/debug/virtual-file?folder=default&file=foo", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-API-Key", testAPIKey)
+
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %s", resp.Status)
+	}
+
+	var data struct {
+		Folder                   string `json:"folder"`
+		File                     string `json:"file"`
+		State                    string `json:"state"`
+		Backend                  string `json:"backend"`
+		ExperimentalVirtualFiles bool   `json:"experimentalVirtualFiles"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		t.Fatal(err)
+	}
+
+	if data.State != string(model.FullLocal) {
+		t.Fatalf("expected state %q, got %q", model.FullLocal, data.State)
+	}
+	if data.File != "foo" || data.Folder != "default" {
+		t.Fatalf("unexpected response payload: %+v", data)
+	}
+	if data.ExperimentalVirtualFiles {
+		t.Fatal("expected experimentalVirtualFiles to be false in response")
+	}
+}
+
+func TestDebugVirtualFileMetadataOnlyMutation(t *testing.T) {
+	t.Parallel()
+
+	cfg := newMockedConfig()
+	cfg.GUIReturns(config.GUIConfiguration{APIKey: testAPIKey, RawAddress: "127.0.0.1:0"})
+	cfg.OptionsReturns(config.OptionsConfiguration{ExperimentalVirtualFiles: true})
+
+	mock := &virtualFileAPITestModel{
+		Model: new(modelmocks.Model),
+		presence: model.FilePresence{
+			Folder:  "default",
+			File:    "foo",
+			State:   model.MetadataOnly,
+			Backend: "localFilesystem",
+		},
+	}
+
+	baseURL := startHTTPWithModel(t, cfg, mock)
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/rest/debug/virtual-file/metadata-only?folder=default&file=foo", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-API-Key", testAPIKey)
+
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %s", resp.Status)
+	}
+	if !mock.setCalled {
+		t.Fatal("expected SetMetadataOnly to be called")
+	}
+
+	var data struct {
+		State                    string `json:"state"`
+		ExperimentalVirtualFiles bool   `json:"experimentalVirtualFiles"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		t.Fatal(err)
+	}
+	if data.State != string(model.MetadataOnly) {
+		t.Fatalf("expected state %q, got %q", model.MetadataOnly, data.State)
+	}
+	if !data.ExperimentalVirtualFiles {
+		t.Fatal("expected experimentalVirtualFiles to be true in response")
+	}
 }
 
 func TestCSRFRequired(t *testing.T) {

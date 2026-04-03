@@ -66,6 +66,10 @@ type OptionsConfiguration struct {
 	RawMaxCIRequestKiB          int      `json:"maxConcurrentIncomingRequestKiB" xml:"maxConcurrentIncomingRequestKiB"`
 	AnnounceLANAddresses        bool     `json:"announceLANAddresses" xml:"announceLANAddresses" default:"true"`
 	SendFullIndexOnUpgrade      bool     `json:"sendFullIndexOnUpgrade" xml:"sendFullIndexOnUpgrade"`
+	// ExperimentalVirtualFiles enables the Phase 1 virtual-files scaffolding.
+	// It is intentionally disabled by default and does not alter standard sync
+	// behavior in this phase.
+	ExperimentalVirtualFiles bool     `json:"experimentalVirtualFiles" xml:"experimentalVirtualFiles" default:"false"`
 	FeatureFlags                []string `json:"featureFlags" xml:"featureFlag"`
 	AuditEnabled                bool     `json:"auditEnabled" xml:"auditEnabled" default:"false" restart:"true"`
 	AuditFile                   string   `json:"auditFile" xml:"auditFile" restart:"true"`

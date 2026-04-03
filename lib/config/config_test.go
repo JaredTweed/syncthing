@@ -328,6 +328,13 @@ func TestOverriddenValues(t *testing.T) {
 	}
 }
 
+func TestExperimentalVirtualFilesDefaultDisabled(t *testing.T) {
+	cfg := New(device1)
+	if cfg.Options.ExperimentalVirtualFiles {
+		t.Fatal("expected experimentalVirtualFiles to default to false")
+	}
+}
+
 func TestDeviceAddressesDynamic(t *testing.T) {
 	name, _ := os.Hostname()
 	expected := map[protocol.DeviceID]DeviceConfiguration{

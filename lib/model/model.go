@@ -151,6 +151,9 @@ type model struct {
 	// folderIOLimiter limits the number of concurrent I/O heavy operations,
 	// such as scans and pulls.
 	folderIOLimiter *semaphore.Semaphore
+	// Experimental virtual-file content backend. Phase 1 defaults to current
+	// local filesystem behavior and is not yet on the data path.
+	contentBackend ContentBackend
 	fatalChan       chan error
 	started         chan struct{}
 	keyGen          *protocol.KeyGenerator
@@ -229,6 +232,7 @@ func NewModel(cfg config.Wrapper, id protocol.DeviceID, sdb db.DB, protectedFile
 		shortID:              id.Short(),
 		globalRequestLimiter: semaphore.New(1024 * cfg.Options().MaxConcurrentIncomingRequestKiB()),
 		folderIOLimiter:      semaphore.New(cfg.Options().MaxFolderConcurrency()),
+		contentBackend:       newContentBackend(),
 		fatalChan:            make(chan error),
 		started:              make(chan struct{}),
 		keyGen:               keyGen,
@@ -924,7 +928,7 @@ func (m *model) folderCompletion(device protocol.DeviceID, folder string) (Folde
 	downloaded := m.deviceDownloads[device].BytesDownloaded(folder)
 	m.mut.RUnlock()
 
-	need, err := m.sdb.CountNeed(folder, device)
+	need, err := m.NeedSize(folder, device)
 	if err != nil {
 		return FolderCompletion{}, err
 	}
@@ -969,7 +973,7 @@ func (m *model) GlobalSize(folder string) (db.Counts, error) {
 }
 
 func (m *model) NeedSize(folder string, device protocol.DeviceID) (db.Counts, error) {
-	return m.sdb.CountNeed(folder, device)
+	return m.effectiveNeedSize(folder, device)
 }
 
 func (m *model) ReceiveOnlySize(folder string) (db.Counts, error) {
@@ -1041,6 +1045,11 @@ func (m *model) NeedFolderFiles(folder string, page, perpage int) ([]protocol.Fi
 		rest = make([]protocol.FileInfo, 0, p.get)
 		it, errFn := m.sdb.AllNeededGlobalFiles(folder, protocol.LocalDeviceID, config.PullOrderAlphabetic, 0, 0)
 		for f := range it {
+			if metadataOnly, err := m.isMetadataOnly(folder, f.Name); err != nil {
+				return nil, nil, nil, err
+			} else if metadataOnly {
+				continue
+			}
 			if cfg.IgnoreDelete && f.IsDeleted() {
 				continue
 			}

@@ -339,7 +339,10 @@ func (s *service) Serve(ctx context.Context) error {
 	debugMux.HandleFunc("/rest/debug/heapprof", s.getHeapProf)
 	debugMux.HandleFunc("/rest/debug/support", s.getSupportBundle)
 	debugMux.HandleFunc("/rest/debug/file", s.getDebugFile)
+	debugMux.HandleFunc("/rest/debug/virtual-file", s.getDebugVirtualFile)
+	debugMux.HandleFunc("/rest/debug/virtual-file/metadata-only", s.postDebugVirtualFileMetadataOnly)
 	restMux.Handler(http.MethodGet, "/rest/debug/*method", debugMux)
+	restMux.Handler(http.MethodPost, "/rest/debug/*method", debugMux)
 
 	// A handler that disables caching
 	noCacheRestMux := noCacheMiddleware(restMux)
@@ -971,6 +974,114 @@ func (s *service) getDebugFile(w http.ResponseWriter, r *http.Request) {
 		"global":       jsonFileInfo(gf),
 		"local":        jsonFileInfo(lf),
 		"availability": av,
+	})
+}
+
+type virtualFilePresenceProvider interface {
+	VirtualFilePresence(folder, file string) (model.FilePresence, error)
+}
+
+type virtualFileMutationProvider interface {
+	SetMetadataOnly(folder, file string) (model.FilePresence, error)
+}
+
+func (s *service) getDebugVirtualFile(w http.ResponseWriter, r *http.Request) {
+	qs := r.URL.Query()
+	folder := qs.Get("folder")
+	file := qs.Get("file")
+
+	opts := s.cfg.Options()
+
+	if provider, ok := s.model.(virtualFilePresenceProvider); ok {
+		presence, err := provider.VirtualFilePresence(folder, file)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if isFolderNotFound(err) || errors.Is(err, protocol.ErrNoSuchFile) {
+				status = http.StatusNotFound
+			}
+			http.Error(w, err.Error(), status)
+			return
+		}
+
+		sendJSON(w, map[string]interface{}{
+			"folder":                   presence.Folder,
+			"file":                     presence.File,
+			"state":                    presence.State,
+			"backend":                  presence.Backend,
+			"experimentalVirtualFiles": opts.ExperimentalVirtualFiles,
+		})
+		return
+	}
+
+	if s.model == nil {
+		http.Error(w, "model unavailable", http.StatusInternalServerError)
+		return
+	}
+
+	_, ok, err := s.model.CurrentFolderFile(folder, file)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if isFolderNotFound(err) {
+			status = http.StatusNotFound
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	if !ok {
+		http.Error(w, protocol.ErrNoSuchFile.Error(), http.StatusNotFound)
+		return
+	}
+
+	sendJSON(w, map[string]interface{}{
+		"folder":                   folder,
+		"file":                     file,
+		"state":                    model.FullLocal,
+		"backend":                  "localFilesystem",
+		"experimentalVirtualFiles": opts.ExperimentalVirtualFiles,
+	})
+}
+
+func (s *service) postDebugVirtualFileMetadataOnly(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	provider, ok := s.model.(virtualFileMutationProvider)
+	if !ok {
+		http.Error(w, "virtual file mutation unavailable", http.StatusInternalServerError)
+		return
+	}
+
+	qs := r.URL.Query()
+	folder := qs.Get("folder")
+	file := qs.Get("file")
+
+	presence, err := provider.SetMetadataOnly(folder, file)
+	if err != nil {
+		status := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, model.ErrExperimentalVirtualFilesDisabled):
+			status = http.StatusConflict
+		case errors.Is(err, model.ErrVirtualFileAlreadyLocal):
+			status = http.StatusConflict
+		case errors.Is(err, model.ErrVirtualFileNotSupported):
+			status = http.StatusBadRequest
+		case isFolderNotFound(err), errors.Is(err, protocol.ErrNoSuchFile):
+			status = http.StatusNotFound
+		case errors.Is(err, protocol.ErrInvalid):
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+
+	sendJSON(w, map[string]interface{}{
+		"folder":                   presence.Folder,
+		"file":                     presence.File,
+		"state":                    presence.State,
+		"backend":                  presence.Backend,
+		"experimentalVirtualFiles": s.cfg.Options().ExperimentalVirtualFiles,
 	})
 }
 

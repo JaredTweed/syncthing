@@ -320,6 +320,11 @@ loop:
 		if err != nil {
 			return nil, nil, err
 		}
+		if metadataOnly, err := f.model.isMetadataOnly(f.folderID, file.Name); err != nil {
+			return nil, nil, err
+		} else if metadataOnly {
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			break loop
