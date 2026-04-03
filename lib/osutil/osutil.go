@@ -71,6 +71,45 @@ func RenameOrCopy(method fs.CopyRangeMethod, src, dst fs.Filesystem, from, to st
 	})
 }
 
+// RenameOrCopyNoReplace moves a file without replacing an existing target.
+// It serializes with other Syncthing rename/copy publish operations, but it
+// cannot prevent out-of-band writers from racing on the same destination path.
+func RenameOrCopyNoReplace(method fs.CopyRangeMethod, src, dst fs.Filesystem, from, to string) error {
+	renameLock.Lock()
+	defer renameLock.Unlock()
+
+	return withPreparedTargetNoReplace(dst, to, func() error {
+		if _, err := dst.Lstat(to); err == nil || fs.IsErrCaseConflict(err) {
+			return fs.ErrExist
+		} else if !fs.IsNotExist(err) {
+			return err
+		}
+
+		if src.Type() == dst.Type() && src.URI() == dst.URI() {
+			return src.Rename(from, to)
+		}
+
+		if src.Type() == dst.Type() {
+			commonPrefix := fs.CommonPrefix(src.URI(), dst.URI())
+			if len(commonPrefix) > 0 {
+				commonFs := fs.NewFilesystem(src.Type(), commonPrefix)
+				err := commonFs.Rename(
+					filepath.Join(strings.TrimPrefix(src.URI(), commonPrefix), from),
+					filepath.Join(strings.TrimPrefix(dst.URI(), commonPrefix), to),
+				)
+				if err == nil {
+					return nil
+				}
+				if fs.IsExist(err) || fs.IsErrCaseConflict(err) {
+					return fs.ErrExist
+				}
+			}
+		}
+
+		return copyFileContentsNoReplace(method, src, dst, from, to)
+	})
+}
+
 // Copy copies the file content from source to destination.
 // Tries hard to succeed on various systems by temporarily tweaking directory
 // permissions and removing the destination file when necessary.
@@ -103,6 +142,15 @@ func withPreparedTarget(filesystem fs.Filesystem, from, to string, f func() erro
 	return f()
 }
 
+func withPreparedTargetNoReplace(filesystem fs.Filesystem, to string, f func() error) error {
+	toDir := filepath.Dir(to)
+	if info, err := filesystem.Stat(toDir); err == nil && info.IsDir() && info.Mode()&0o200 == 0 {
+		filesystem.Chmod(toDir, 0o755)
+		defer filesystem.Chmod(toDir, info.Mode())
+	}
+	return f()
+}
+
 // copyFileContents copies the contents of the file named src to the file named
 // by dst. The file will be created if it does not already exist. If the
 // destination file exists, all its contents will be replaced by the contents
@@ -129,6 +177,40 @@ func copyFileContents(method fs.CopyRangeMethod, srcFs, dstFs fs.Filesystem, src
 	}
 	err = fs.CopyRange(method, in, out, 0, 0, inFi.Size())
 	return
+}
+
+func copyFileContentsNoReplace(method fs.CopyRangeMethod, srcFs, dstFs fs.Filesystem, src, dst string) (err error) {
+	in, err := srcFs.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	inFi, err := in.Stat()
+	if err != nil {
+		return err
+	}
+
+	mode := inFi.Mode()
+	if mode == 0 {
+		mode = 0o666
+	}
+	out, err := dstFs.OpenFile(dst, fs.OptReadWrite|fs.OptCreate|fs.OptExclusive, mode)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		cerr := out.Close()
+		if err == nil {
+			err = cerr
+		}
+		if err != nil {
+			_ = dstFs.Remove(dst)
+		}
+	}()
+
+	err = fs.CopyRange(method, in, out, 0, 0, inFi.Size())
+	return err
 }
 
 func IsDeleted(ffs fs.Filesystem, name string) bool {

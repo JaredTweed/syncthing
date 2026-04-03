@@ -1730,7 +1730,8 @@ func (f *sendReceiveFolder) materializeVirtualFile(ctx context.Context, file pro
 		return ErrVirtualFileNotSupported
 	}
 
-	if _, statErr := f.mtimefs.Lstat(file.Name); statErr == nil {
+	if _, statErr := f.mtimefs.Lstat(file.Name); statErr == nil || fs.IsErrCaseConflict(statErr) {
+		f.ScheduleForceRescan(file.Name)
 		return ErrVirtualFileAlreadyLocal
 	} else if !fs.IsNotExist(statErr) {
 		return statErr
@@ -1835,12 +1836,17 @@ func (f *sendReceiveFolder) finishVirtualFileMaterialization(file protocol.FileI
 	}
 
 	if _, err := f.mtimefs.Lstat(file.Name); err == nil || fs.IsErrCaseConflict(err) {
+		f.ScheduleForceRescan(file.Name)
 		return ErrVirtualFileAlreadyLocal
 	} else if !fs.IsNotExist(err) {
 		return fmt.Errorf("checking existing file: %w", err)
 	}
 
-	if err := osutil.RenameOrCopy(f.CopyRangeMethod.ToFS(), f.mtimefs, f.mtimefs, tempName, file.Name); err != nil {
+	if err := osutil.RenameOrCopyNoReplace(f.CopyRangeMethod.ToFS(), f.mtimefs, f.mtimefs, tempName, file.Name); err != nil {
+		if fs.IsExist(err) || fs.IsErrCaseConflict(err) {
+			f.ScheduleForceRescan(file.Name)
+			return ErrVirtualFileAlreadyLocal
+		}
 		return fmt.Errorf("replacing file: %w", err)
 	}
 

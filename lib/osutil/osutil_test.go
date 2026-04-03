@@ -136,6 +136,68 @@ func TestRenameOrCopy(t *testing.T) {
 	}
 }
 
+func TestRenameOrCopyNoReplace(t *testing.T) {
+	sameFs := fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(32)+"?content=true")
+	tests := []struct {
+		name string
+		src  fs.Filesystem
+		dst  fs.Filesystem
+	}{
+		{
+			name: "same filesystem",
+			src:  sameFs,
+			dst:  sameFs,
+		},
+		{
+			name: "different filesystems",
+			src:  fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(32)+"?content=true"),
+			dst:  fs.NewFilesystem(fs.FilesystemTypeFake, rand.String(32)+"?content=true"),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fd, err := test.src.Create("from")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fd.Write([]byte("source")); err != nil {
+				t.Fatal(err)
+			}
+			_ = fd.Close()
+
+			fd, err = test.dst.Create("to")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fd.Write([]byte("dest")); err != nil {
+				t.Fatal(err)
+			}
+			_ = fd.Close()
+
+			err = osutil.RenameOrCopyNoReplace(fs.CopyRangeMethodStandard, test.src, test.dst, "from", "to")
+			if !fs.IsExist(err) {
+				t.Fatalf("expected ErrExist, got %v", err)
+			}
+
+			if fd, err := test.dst.Open("to"); err != nil {
+				t.Fatal(err)
+			} else {
+				t.Cleanup(func() {
+					_ = fd.Close()
+				})
+				buf, err := io.ReadAll(fd)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(buf) != "dest" {
+					t.Fatalf("destination was replaced: %q", buf)
+				}
+			}
+		})
+	}
+}
+
 func TestIPFromString(t *testing.T) {
 	t.Parallel()
 

@@ -56,6 +56,7 @@ func (m *model) FetchVirtualFile(ctx context.Context, folder, file string) (File
 	if exists, err := virtualFileExistsLocally(cfg.Filesystem(), name); err != nil {
 		return FilePresence{}, err
 	} else if exists {
+		m.scheduleVirtualFileRescan(folder, name)
 		if _, err := m.clearVirtualFilePresence(folder, name); err != nil {
 			return FilePresence{}, err
 		}

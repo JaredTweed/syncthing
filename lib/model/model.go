@@ -2566,6 +2566,24 @@ func (m *model) DelayScan(folder string, next time.Duration) {
 	runner.DelayScan(next)
 }
 
+type virtualFileRescanner interface {
+	ScheduleForceRescan(path string)
+}
+
+func (m *model) scheduleVirtualFileRescan(folder, path string) {
+	m.mut.RLock()
+	runner, ok := m.folderRunners.Get(folder)
+	m.mut.RUnlock()
+	if !ok {
+		return
+	}
+	if rescanner, ok := runner.(virtualFileRescanner); ok {
+		rescanner.ScheduleForceRescan(path)
+		return
+	}
+	runner.ScheduleScan()
+}
+
 // numHashers returns the number of hasher routines to use for a given folder,
 // taking into account configuration and available CPU cores.
 func (m *model) numHashers(folder string) int {

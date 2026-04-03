@@ -82,6 +82,10 @@ func (m *model) notifyVirtualFileHooks(event VirtualFileEvent) {
 	}
 	m.mut.RUnlock()
 
+	// Delivery remains synchronous to preserve deterministic ordering with the
+	// state transition that triggered the event. These hooks are internal and
+	// experimental; panic recovery isolates bad hooks without introducing a
+	// background queue that could reorder or drop lifecycle events.
 	for _, hook := range hooks {
 		if hook == nil {
 			continue

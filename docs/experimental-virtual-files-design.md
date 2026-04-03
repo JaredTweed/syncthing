@@ -154,6 +154,7 @@ Phase 3 implementation notes:
 - Failures leave the metadata-only record in place and do not create an OS-visible placeholder file.
 - The explicit fetch finisher is now separate from the normal pull/conflict finisher to avoid reusing scan-queue side effects in a one-shot API path.
 - Fetch revalidates that the current global file is still the same regular-file version before making the content visible locally.
+- Final publish now uses a no-replace helper under Syncthing's rename lock, which removes internal Syncthing replace races against other rename/copy publishers.
 
 ### Phase 4: Desktop Virtual Filesystem Integration Hooks
 
@@ -166,6 +167,7 @@ Phase 4 implementation notes:
 - The current hooks report placeholder creation, explicit fetch start/completion/failure, and placeholder clearing when a real local file update supersedes a placeholder.
 - No platform-specific filesystem driver, kernel integration, or OS placeholder exposure is included in this phase.
 - Hook dispatch is synchronous for ordering, but now recovers from hook panics so experimental integrations cannot crash the core model.
+- Hook dispatch intentionally remains synchronous. Reordering or buffering these lifecycle events behind a background queue would make it harder for a future desktop bridge to reason about placeholder creation, fetch completion, and placeholder clearing relative to the state transition that triggered them.
 
 ### Phase 5: Optional Content-Addressed Backend Interface
 
@@ -189,5 +191,11 @@ Phase 5 implementation notes:
 - Explicit mutation and fetch reject empty or root-like paths (`""`, `"."`) as invalid.
 - `SetMetadataOnly` now checks both the local index and the real filesystem, so an unscanned local file cannot be overwritten by a placeholder record.
 - Fetch failure keeps the metadata-only record in place and cleans up the temporary file.
+- If a real local file appears while an explicit fetch is in progress, fetch now fails with `ErrVirtualFileAlreadyLocal`, schedules a rescan, and leaves the local file in place.
+- If the remote file version changes while an explicit fetch is in progress, fetch fails with `ErrVirtualFileStale` and leaves the placeholder record intact.
 - Restart safety still relies on Syncthing's normal temp-file cleanup and local scan/update behavior. If a crash happens after a successful rename but before the local index update, the next scan should reconcile the local index and clear stale placeholder metadata.
-- Remaining limitation: the current filesystem abstraction does not expose an atomic "rename without replace" primitive. The fetch path rechecks that the destination is absent immediately before publish, but there is still a small TOCTOU window where an out-of-band local writer could create the final path between that check and the final rename/copy.
+- Remaining limitation: the current filesystem abstraction still does not expose an atomic "rename without replace" primitive for the same-filesystem rename case. The remaining race window is now narrower and precisely scoped:
+  - internal Syncthing publishers are serialized by the rename lock
+  - the residual risk is only an out-of-band writer creating the destination path after the last existence check inside the no-replace publish helper and before the underlying same-filesystem rename executes
+  - on platforms where rename replaces an existing target, that out-of-band file could still be overwritten
+  - this residual risk is not claimed to be solved in the current prototype
