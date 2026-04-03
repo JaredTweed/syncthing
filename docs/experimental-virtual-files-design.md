@@ -150,11 +150,13 @@ Phase 3 implementation notes:
 - Explicit fetch is exposed as `POST /rest/debug/virtual-file/fetch?folder=<id>&file=<path>`.
 - The fetch path is still fully feature-gated by `experimentalVirtualFiles`.
 - Only the explicitly requested metadata-only file is materialized; the normal background pull queue remains unchanged.
-- The default backend reuses Syncthing's existing block request and hash verification logic, writes a temp file, renames it into place, updates the local index, and clears the metadata-only record on success.
+- The default backend reuses Syncthing's existing block request and hash verification logic, writes a temp file, publishes it without replacement, and then reconciles the result through a targeted local rescan before clearing the metadata-only record.
 - Failures leave the metadata-only record in place and do not create an OS-visible placeholder file.
 - The explicit fetch finisher is now separate from the normal pull/conflict finisher to avoid reusing scan-queue side effects in a one-shot API path.
 - Fetch revalidates that the current global file is still the same regular-file version before making the content visible locally.
-- Final publish now uses a no-replace helper under Syncthing's rename lock, which removes internal Syncthing replace races against other rename/copy publishers.
+- Final publish now uses an atomic no-replace publish helper under Syncthing's rename lock.
+- The helper uses a hard-link style publish on local basic filesystems, so an out-of-band local writer can win by creating the destination first, but it cannot be overwritten by the virtual-file materialization path.
+- There is no overwrite-capable fallback in the explicit virtual-file publish path. If the filesystem cannot support the safe publish primitive, fetch fails and leaves the metadata-only record intact.
 
 ### Phase 4: Desktop Virtual Filesystem Integration Hooks
 
@@ -193,9 +195,8 @@ Phase 5 implementation notes:
 - Fetch failure keeps the metadata-only record in place and cleans up the temporary file.
 - If a real local file appears while an explicit fetch is in progress, fetch now fails with `ErrVirtualFileAlreadyLocal`, schedules a rescan, and leaves the local file in place.
 - If the remote file version changes while an explicit fetch is in progress, fetch fails with `ErrVirtualFileStale` and leaves the placeholder record intact.
-- Restart safety still relies on Syncthing's normal temp-file cleanup and local scan/update behavior. If a crash happens after a successful rename but before the local index update, the next scan should reconcile the local index and clear stale placeholder metadata.
-- Remaining limitation: the current filesystem abstraction still does not expose an atomic "rename without replace" primitive for the same-filesystem rename case. The remaining race window is now narrower and precisely scoped:
-  - internal Syncthing publishers are serialized by the rename lock
-  - the residual risk is only an out-of-band writer creating the destination path after the last existence check inside the no-replace publish helper and before the underlying same-filesystem rename executes
-  - on platforms where rename replaces an existing target, that out-of-band file could still be overwritten
-  - this residual risk is not claimed to be solved in the current prototype
+- Explicit fetch now adopts materialized content through a targeted local rescan instead of directly trusting the remote metadata after publish. This means a local writer that changes the file after publish but before adoption is reconciled from disk, not from the stale fetched metadata.
+- Restart safety now relies on two conservative properties:
+  - published files are adopted through the normal local scan path on restart, which clears stale placeholder metadata
+  - if a crash happens after publish but before staged-temp cleanup, the leftover temp name remains ignored and the published final file is still reconciled safely on the next scan
+- Remaining limitation: safe explicit fetch publish now depends on a no-replace primitive being available for the current local basic filesystem. On filesystems where hard-link publish is unsupported, explicit fetch fails conservatively instead of falling back to an overwrite-capable path.

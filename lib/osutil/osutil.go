@@ -8,6 +8,7 @@
 package osutil
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,8 @@ import (
 // Try to keep this entire operation atomic-like. We shouldn't be doing this
 // often enough that there is any contention on this lock.
 var renameLock sync.Mutex
+
+var ErrNoReplacePublishUnsupported = errors.New("safe no-replace publish is not supported on this filesystem")
 
 // RenameOrCopy renames a file, leaving source file intact in case of failure.
 // Tries hard to succeed on various systems by temporarily tweaking directory
@@ -71,42 +74,50 @@ func RenameOrCopy(method fs.CopyRangeMethod, src, dst fs.Filesystem, from, to st
 	})
 }
 
-// RenameOrCopyNoReplace moves a file without replacing an existing target.
-// It serializes with other Syncthing rename/copy publish operations, but it
-// cannot prevent out-of-band writers from racing on the same destination path.
-func RenameOrCopyNoReplace(method fs.CopyRangeMethod, src, dst fs.Filesystem, from, to string) error {
+var beforeNoReplacePublishHook func()
+
+// RenameOrCopyNoReplace publishes a fully-written staged file without
+// replacing an existing target. It only succeeds when it can use a safe
+// no-replace publish primitive; otherwise it fails without adopting the file.
+func RenameOrCopyNoReplace(_ fs.CopyRangeMethod, src, dst fs.Filesystem, from, to string) error {
 	renameLock.Lock()
 	defer renameLock.Unlock()
 
 	return withPreparedTargetNoReplace(dst, to, func() error {
-		if _, err := dst.Lstat(to); err == nil || fs.IsErrCaseConflict(err) {
-			return fs.ErrExist
-		} else if !fs.IsNotExist(err) {
+		if src.Type() != fs.FilesystemTypeBasic || dst.Type() != fs.FilesystemTypeBasic || src.URI() != dst.URI() {
+			return ErrNoReplacePublishUnsupported
+		}
+
+		fromPath, err := rootedBasicPath(src, from)
+		if err != nil {
+			return err
+		}
+		toPath, err := rootedBasicPath(dst, to)
+		if err != nil {
 			return err
 		}
 
-		if src.Type() == dst.Type() && src.URI() == dst.URI() {
-			return src.Rename(from, to)
+		if beforeNoReplacePublishHook != nil {
+			beforeNoReplacePublishHook()
 		}
 
-		if src.Type() == dst.Type() {
-			commonPrefix := fs.CommonPrefix(src.URI(), dst.URI())
-			if len(commonPrefix) > 0 {
-				commonFs := fs.NewFilesystem(src.Type(), commonPrefix)
-				err := commonFs.Rename(
-					filepath.Join(strings.TrimPrefix(src.URI(), commonPrefix), from),
-					filepath.Join(strings.TrimPrefix(dst.URI(), commonPrefix), to),
-				)
-				if err == nil {
-					return nil
-				}
-				if fs.IsExist(err) || fs.IsErrCaseConflict(err) {
-					return fs.ErrExist
-				}
+		if err := os.Link(fromPath, toPath); err != nil {
+			if os.IsExist(err) {
+				return fs.ErrExist
 			}
+			return err
 		}
 
-		return copyFileContentsNoReplace(method, src, dst, from, to)
+		// The final name is live now. A failure to remove the staging name or
+		// sync the parent directory leaves an ignored temp file behind, but it
+		// must not roll back the published file or report the publish as absent.
+		if err := src.Remove(from); err != nil && !fs.IsNotExist(err) {
+			_ = syncParentDir(dst, to)
+			return nil
+		}
+
+		_ = syncParentDir(dst, to)
+		return nil
 	})
 }
 
@@ -149,6 +160,24 @@ func withPreparedTargetNoReplace(filesystem fs.Filesystem, to string, f func() e
 		defer filesystem.Chmod(toDir, info.Mode())
 	}
 	return f()
+}
+
+func rootedBasicPath(filesystem fs.Filesystem, name string) (string, error) {
+	name, err := fs.Canonicalize(name)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filesystem.URI(), name), nil
+}
+
+func syncParentDir(filesystem fs.Filesystem, path string) error {
+	dir := filepath.Dir(path)
+	fd, err := filesystem.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer fd.Close()
+	return fd.Sync()
 }
 
 // copyFileContents copies the contents of the file named src to the file named

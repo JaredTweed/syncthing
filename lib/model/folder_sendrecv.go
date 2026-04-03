@@ -1789,7 +1789,7 @@ func (f *sendReceiveFolder) materializeVirtualFile(ctx context.Context, file pro
 	if err := f.finishVirtualFileMaterialization(file, tempName); err != nil {
 		return err
 	}
-	return f.updateLocalsFromVirtualFiles([]protocol.FileInfo{file})
+	return nil
 }
 
 func (f *sendReceiveFolder) checkVirtualFileParent(file string) error {

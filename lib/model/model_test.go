@@ -256,12 +256,6 @@ func TestMetadataOnlyPlaceholderRemovesNeedAndPulling(t *testing.T) {
 	m := setupModel(t, wrapper)
 	defer cleanupModel(m)
 
-	fc := addFakeConn(m, device1, fcfg.ID)
-	fc.RequestCalls(func(context.Context, *protocol.Request) ([]byte, error) {
-		t.Fatal("metadata-only placeholder should not trigger a block request")
-		return nil, nil
-	})
-
 	data := []byte("metadata only contents")
 	blockSize := protocol.BlockSize(int64(len(data)))
 	blocks, err := scanner.Blocks(context.Background(), bytes.NewReader(data), blockSize, int64(len(data)), nil)
@@ -326,6 +320,12 @@ func TestMetadataOnlyPlaceholderRemovesNeedAndPulling(t *testing.T) {
 		t.Fatalf("metadata-only placeholder must not exist on the filesystem, got err=%v", err)
 	}
 
+	fc := addFakeConn(m, device1, fcfg.ID)
+	fc.RequestCalls(func(context.Context, *protocol.Request) ([]byte, error) {
+		t.Fatal("metadata-only placeholder should not trigger a block request")
+		return nil, nil
+	})
+
 	m.mut.RLock()
 	runner, ok := m.folderRunners.Get(fcfg.ID)
 	m.mut.RUnlock()
@@ -379,7 +379,7 @@ func TestSetMetadataOnlyRequiresExperimentalFlag(t *testing.T) {
 }
 
 func TestFetchVirtualFileMaterializesMetadataOnlyPlaceholder(t *testing.T) {
-	wrapper, fcfg := newDefaultCfgWrapper(t)
+	wrapper, fcfg := newDefaultBasicCfgWrapper(t)
 	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
 		cfg.Options.ExperimentalVirtualFiles = true
 	})
@@ -441,8 +441,82 @@ func TestFetchVirtualFileMaterializesMetadataOnlyPlaceholder(t *testing.T) {
 	}
 }
 
+func TestFetchVirtualFileReconcilesPublishedFileThroughScan(t *testing.T) {
+	wrapper, fcfg := newDefaultBasicCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	m, fc := setupModelWithConnectionFromWrapper(t, wrapper)
+	defer cleanupModel(m)
+
+	remoteData := []byte("remote fetch payload")
+	localData := []byte("local content after publish wins")
+	fc.addFile("reconcile.txt", 0o644, protocol.FileInfoTypeFile, remoteData)
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(fc.files[0])}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.SetMetadataOnly(fcfg.ID, "reconcile.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	afterVirtualFileMaterializeHook = func(folder, file string) {
+		if folder != fcfg.ID || file != "reconcile.txt" {
+			return
+		}
+		afterVirtualFileMaterializeHook = nil
+		writeFile(t, fcfg.Filesystem(), file, localData)
+	}
+	defer func() {
+		afterVirtualFileMaterializeHook = nil
+	}()
+
+	presence, err := m.FetchVirtualFile(context.Background(), fcfg.ID, "reconcile.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presence.State != FullLocal {
+		t.Fatalf("expected FullLocal after reconciliation, got %+v", presence)
+	}
+
+	fd, err := fcfg.Filesystem().Open("reconcile.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fd.Close()
+
+	got, err := io.ReadAll(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, localData) {
+		t.Fatalf("expected scan reconciliation to keep local content, got %q", got)
+	}
+
+	local, ok, err := m.sdb.GetDeviceFile(fcfg.ID, protocol.LocalDeviceID, "reconcile.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected reconciled local file in index")
+	}
+	if local.Size != int64(len(localData)) {
+		t.Fatalf("expected reconciled local size %d, got %d", len(localData), local.Size)
+	}
+	if metadataOnly, err := m.isMetadataOnly(fcfg.ID, "reconcile.txt"); err != nil {
+		t.Fatal(err)
+	} else if metadataOnly {
+		t.Fatal("expected metadata-only state to be cleared after reconciliation")
+	}
+}
+
 func TestFetchVirtualFileUnavailableContentFailsSafely(t *testing.T) {
-	wrapper, fcfg := newDefaultCfgWrapper(t)
+	wrapper, fcfg := newDefaultBasicCfgWrapper(t)
 	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
 		cfg.Options.ExperimentalVirtualFiles = true
 	})
@@ -821,7 +895,7 @@ func (*panicVirtualFileHook) HandleVirtualFileEvent(VirtualFileEvent) {
 }
 
 func TestVirtualFileHooksReceiveLifecycleEvents(t *testing.T) {
-	wrapper, fcfg := newDefaultCfgWrapper(t)
+	wrapper, fcfg := newDefaultBasicCfgWrapper(t)
 	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
 		cfg.Options.ExperimentalVirtualFiles = true
 	})
@@ -876,7 +950,7 @@ func TestVirtualFileHooksReceiveLifecycleEvents(t *testing.T) {
 }
 
 func TestVirtualFilePanickingHookDoesNotBreakOperations(t *testing.T) {
-	wrapper, fcfg := newDefaultCfgWrapper(t)
+	wrapper, fcfg := newDefaultBasicCfgWrapper(t)
 	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
 		cfg.Options.ExperimentalVirtualFiles = true
 	})
@@ -913,7 +987,7 @@ func TestVirtualFilePanickingHookDoesNotBreakOperations(t *testing.T) {
 }
 
 func TestFetchVirtualFileCorruptedRemoteDataFailsSafely(t *testing.T) {
-	wrapper, fcfg := newDefaultCfgWrapper(t)
+	wrapper, fcfg := newDefaultBasicCfgWrapper(t)
 	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
 		cfg.Options.ExperimentalVirtualFiles = true
 	})
@@ -961,7 +1035,7 @@ func TestFetchVirtualFileCorruptedRemoteDataFailsSafely(t *testing.T) {
 }
 
 func TestFetchVirtualFileConcurrentRequests(t *testing.T) {
-	wrapper, fcfg := newDefaultCfgWrapper(t)
+	wrapper, fcfg := newDefaultBasicCfgWrapper(t)
 	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
 		cfg.Options.ExperimentalVirtualFiles = true
 	})
@@ -1031,7 +1105,7 @@ func TestFetchVirtualFileConcurrentRequests(t *testing.T) {
 }
 
 func TestFetchVirtualFileLocalFileAppearsDuringFetchFailsSafely(t *testing.T) {
-	wrapper, fcfg := newDefaultCfgWrapper(t)
+	wrapper, fcfg := newDefaultBasicCfgWrapper(t)
 	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
 		cfg.Options.ExperimentalVirtualFiles = true
 	})
@@ -1117,7 +1191,7 @@ func TestFetchVirtualFileLocalFileAppearsDuringFetchFailsSafely(t *testing.T) {
 }
 
 func TestFetchVirtualFileRemoteUpdateDuringFetchFailsStale(t *testing.T) {
-	wrapper, fcfg := newDefaultCfgWrapper(t)
+	wrapper, fcfg := newDefaultBasicCfgWrapper(t)
 	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
 		cfg.Options.ExperimentalVirtualFiles = true
 	})
@@ -1269,7 +1343,7 @@ func TestVirtualFileRemoteTypeChangeClearsPlaceholderState(t *testing.T) {
 }
 
 func TestVirtualFileCanceledFetchRestartPreservesPlaceholder(t *testing.T) {
-	wrapper, fcfg := newDefaultCfgWrapper(t)
+	wrapper, fcfg := newDefaultBasicCfgWrapper(t)
 	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
 		cfg.Options.ExperimentalVirtualFiles = true
 	})
@@ -1343,6 +1417,93 @@ func TestVirtualFileCanceledFetchRestartPreservesPlaceholder(t *testing.T) {
 	}
 	if presence.State != MetadataOnly {
 		t.Fatalf("expected metadata-only state to survive canceled fetch and restart, got %+v", presence)
+	}
+}
+
+func TestVirtualFileRestartWithPublishedTempReconcilesSafely(t *testing.T) {
+	wrapper, fcfg := newDefaultBasicCfgWrapper(t)
+	waiter, err := wrapper.Modify(func(cfg *config.Configuration) {
+		cfg.Options.ExperimentalVirtualFiles = true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter.Wait()
+
+	dbDir := t.TempDir()
+	m := newModelWithDBDir(t, wrapper, myID, nil, dbDir)
+	m.ServeBackground()
+	if err := m.ScanFolder(fcfg.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	data := []byte("published before crash")
+	blockSize := protocol.BlockSize(int64(len(data)))
+	blocks, err := scanner.Blocks(context.Background(), bytes.NewReader(data), blockSize, int64(len(data)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := protocol.FileInfo{
+		Name:         "published.txt",
+		Type:         protocol.FileInfoTypeFile,
+		Size:         int64(len(data)),
+		ModifiedS:    time.Now().Unix(),
+		Permissions:  0o644,
+		RawBlockSize: int32(blockSize),
+		Blocks:       blocks,
+		Version:      protocol.Vector{}.Update(device1.Short()),
+		Sequence:     1,
+	}
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(file)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.SetMetadataOnly(fcfg.ID, file.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	tempName := fs.TempName(file.Name)
+	writeFile(t, fcfg.Filesystem(), tempName, data)
+	if err := os.Link(filepath.Join(fcfg.Filesystem().URI(), tempName), filepath.Join(fcfg.Filesystem().URI(), file.Name)); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupModel(m)
+
+	m2 := newModelWithDBDir(t, wrapper, myID, nil, dbDir)
+	m2.ServeBackground()
+	if err := m2.ScanFolder(fcfg.ID); err != nil {
+		t.Fatal(err)
+	}
+	defer cleanupModel(m2)
+
+	presence, err := m2.VirtualFilePresence(fcfg.ID, file.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if presence.State != FullLocal {
+		t.Fatalf("expected published file to reconcile as FullLocal after restart, got %+v", presence)
+	}
+	if metadataOnly, err := m2.isMetadataOnly(fcfg.ID, file.Name); err != nil {
+		t.Fatal(err)
+	} else if metadataOnly {
+		t.Fatal("expected placeholder to be cleared after restart reconciliation")
+	}
+
+	fd, err := fcfg.Filesystem().Open(file.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fd.Close()
+	got, err := io.ReadAll(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("unexpected reconciled file content: %q", got)
+	}
+
+	if _, err := fcfg.Filesystem().Lstat(tempName); err != nil {
+		t.Fatalf("expected staged temp file to remain safely ignored after restart, got %v", err)
 	}
 }
 

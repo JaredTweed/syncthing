@@ -98,6 +98,19 @@ func newDefaultCfgWrapper(t testing.TB) (config.Wrapper, config.FolderConfigurat
 	return w, fcfg
 }
 
+func newDefaultBasicCfgWrapper(t testing.TB) (config.Wrapper, config.FolderConfiguration) {
+	w, cancel := newConfigWrapperFromContext(t.Context(), defaultCfgWrapper.RawCopy())
+	t.Cleanup(cancel)
+	fcfg := newFolderConfiguration(w, "default", "default", config.FilesystemTypeBasic, t.TempDir())
+	fcfg.FSWatcherEnabled = false
+	fcfg.PullerDelayS = 0
+	fcfg.Devices = append(fcfg.Devices, config.FolderDeviceConfiguration{DeviceID: device1})
+	_, _ = w.Modify(func(cfg *config.Configuration) {
+		cfg.SetFolder(fcfg)
+	})
+	return w, fcfg
+}
+
 func newConfigWrapperFromContext(ctx context.Context, cfg config.Configuration) (config.Wrapper, context.CancelFunc) {
 	wrapper := config.Wrap("", cfg, myID, events.NoopLogger)
 	ctx, cancel := context.WithCancel(ctx)

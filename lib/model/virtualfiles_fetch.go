@@ -22,8 +22,14 @@ var (
 	ErrVirtualFileStale              = errors.New("file changed while being materialized")
 )
 
+var afterVirtualFileMaterializeHook func(folder, file string)
+
 type virtualFileMaterializer interface {
 	materializeVirtualFile(ctx context.Context, file protocol.FileInfo) error
+}
+
+type virtualFileLocalUpdater interface {
+	updateLocalsFromVirtualFiles([]protocol.FileInfo) error
 }
 
 // FetchVirtualFile materializes a metadata-only record into a real local file.
@@ -90,6 +96,19 @@ func (m *model) FetchVirtualFile(ctx context.Context, folder, file string) (File
 		m.notifyVirtualFileHooks(m.newVirtualFileEvent(VirtualFileEventFetchFailed, metadataPresence, err))
 		return FilePresence{}, err
 	}
+	if afterVirtualFileMaterializeHook != nil {
+		afterVirtualFileMaterializeHook(folder, name)
+	}
+	if err := m.ScanFolderSubdirs(folder, []string{name}); err != nil {
+		err = fmt.Errorf("reconciling materialized %s: %w", name, err)
+		m.notifyVirtualFileHooks(m.newVirtualFileEvent(VirtualFileEventFetchFailed, metadataPresence, err))
+		return FilePresence{}, err
+	}
+	if err := m.promoteMaterializedVirtualFile(cfg, global); err != nil {
+		err = fmt.Errorf("finalizing materialized %s: %w", name, err)
+		m.notifyVirtualFileHooks(m.newVirtualFileEvent(VirtualFileEventFetchFailed, metadataPresence, err))
+		return FilePresence{}, err
+	}
 
 	presence, err := m.VirtualFilePresence(folder, name)
 	if err != nil {
@@ -124,4 +143,35 @@ func (m *model) materializeLocalFile(ctx context.Context, folder config.FolderCo
 	}
 
 	return nil
+}
+
+func (m *model) promoteMaterializedVirtualFile(folder config.FolderConfiguration, file protocol.FileInfo) error {
+	local, ok, err := m.sdb.GetDeviceFile(folder.ID, protocol.LocalDeviceID, file.Name)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return protocol.ErrNoSuchFile
+	}
+	if !local.IsEquivalentOptional(file, protocol.FileInfoComparison{
+		ModTimeWindow: folder.ModTimeWindow(),
+		IgnorePerms:   folder.IgnorePerms,
+		IgnoreFlags:   protocol.LocalAllFlags,
+	}) {
+		return nil
+	}
+
+	m.mut.RLock()
+	runner, ok := m.folderRunners.Get(folder.ID)
+	m.mut.RUnlock()
+	if !ok {
+		return ErrFolderNotRunning
+	}
+
+	updater, ok := runner.(virtualFileLocalUpdater)
+	if !ok {
+		return ErrVirtualFileFetchUnsupported
+	}
+
+	return updater.updateLocalsFromVirtualFiles([]protocol.FileInfo{file})
 }
