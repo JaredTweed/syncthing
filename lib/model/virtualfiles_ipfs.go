@@ -45,6 +45,20 @@ type ipfsContentAddressableBackend struct {
 	lastHealth ContentAddressableBackendHealth
 }
 
+func (b *ipfsContentAddressableBackend) updateHealth(healthy bool, reason string) ContentAddressableBackendHealth {
+	status := ContentAddressableBackendHealth{
+		Backend:    b.BackendType(),
+		Configured: true,
+		Healthy:    healthy,
+		Reason:     reason,
+		Checked:    time.Now().UTC(),
+	}
+	b.mut.Lock()
+	b.lastHealth = status
+	b.mut.Unlock()
+	return status
+}
+
 type ipfsAddResponse struct {
 	Hash string `json:"Hash"`
 }
@@ -176,10 +190,7 @@ func (b *ipfsContentAddressableBackend) Health(ctx context.Context) ContentAddre
 		}
 	}
 
-	b.mut.Lock()
-	b.lastHealth = status
-	b.mut.Unlock()
-	return status
+	return b.updateHealth(status.Healthy, status.Reason)
 }
 
 func (b *ipfsContentAddressableBackend) ReferenceForFile(folder config.FolderConfiguration, file protocol.FileInfo) (ContentAddressableReference, bool, error) {
@@ -271,6 +282,7 @@ func (b *ipfsContentAddressableBackend) Get(ctx context.Context, ref ContentAddr
 	resp, err := b.do(reqCtx, http.MethodPost, "/api/v0/cat", url.Values{"arg": []string{ref.Locator}}, nil, "")
 	if err != nil {
 		cancel()
+		b.updateHealth(false, err.Error())
 		return nil, ErrContentAddressableBackendUnavailable
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -278,10 +290,13 @@ func (b *ipfsContentAddressableBackend) Get(ctx context.Context, ref ContentAddr
 		body, _ := io.ReadAll(resp.Body)
 		cancel()
 		if isIPFSNotFound(body, resp.StatusCode) {
+			b.updateHealth(true, "")
 			return nil, ErrContentAddressableObjectMissing
 		}
+		b.updateHealth(false, http.StatusText(resp.StatusCode))
 		return nil, ErrContentAddressableBackendUnavailable
 	}
+	b.updateHealth(true, "")
 
 	return &verifyingReadCloser{
 		ReadCloser: &contextCancelReadCloser{ReadCloser: resp.Body, cancel: cancel},
@@ -356,30 +371,36 @@ func (b *ipfsContentAddressableBackend) Put(ctx context.Context, ref ContentAddr
 	resp, err := b.do(reqCtx, http.MethodPost, "/api/v0/add", params, pr, writer.FormDataContentType())
 	result := <-resultCh
 	if result.err != nil {
+		b.updateHealth(false, result.err.Error())
 		return ContentAddressableReference{}, result.err
 	}
 	if err != nil {
+		b.updateHealth(false, err.Error())
 		return ContentAddressableReference{}, ErrContentAddressableBackendUnavailable
 	}
 	body, status, err := (*ProcesslessResponseReader)(nil).read(resp)
 	if err != nil {
+		b.updateHealth(false, err.Error())
 		return ContentAddressableReference{}, ErrContentAddressableBackendUnavailable
 	}
 	if result.written != ref.Size || result.sum != ref.Key {
 		return ContentAddressableReference{}, ErrContentAddressableDigestMismatch
 	}
 	if status != http.StatusOK {
+		b.updateHealth(false, http.StatusText(status))
 		return ContentAddressableReference{}, ErrContentAddressableBackendUnavailable
 	}
 
 	locator, err := parseIPFSAddResponse(body)
 	if err != nil {
+		b.updateHealth(false, err.Error())
 		return ContentAddressableReference{}, err
 	}
 	ref.Locator = locator
 	if err := b.ensureObjectMeta(ref); err != nil {
 		return ContentAddressableReference{}, err
 	}
+	b.updateHealth(true, "")
 	return ref, nil
 }
 

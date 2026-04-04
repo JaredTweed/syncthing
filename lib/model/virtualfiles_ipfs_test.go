@@ -30,7 +30,10 @@ type fakeIPFSServer struct {
 	server *httptest.Server
 
 	versionStatus int
+	versionDelay  time.Duration
 	addStatus     int
+	addDelay      time.Duration
+	catDelay      map[string]time.Duration
 	catStatus     map[string]int
 	catBodies     map[string][]byte
 	objects       map[string][]byte
@@ -43,6 +46,7 @@ func newFakeIPFSServer(t *testing.T) *fakeIPFSServer {
 		t:             t,
 		versionStatus: http.StatusOK,
 		addStatus:     http.StatusOK,
+		catDelay:      make(map[string]time.Duration),
 		catStatus:     make(map[string]int),
 		catBodies:     make(map[string][]byte),
 		objects:       make(map[string][]byte),
@@ -58,6 +62,9 @@ func newFakeIPFSServer(t *testing.T) *fakeIPFSServer {
 }
 
 func (s *fakeIPFSServer) handleVersion(w http.ResponseWriter, _ *http.Request) {
+	if s.versionDelay > 0 {
+		time.Sleep(s.versionDelay)
+	}
 	if s.versionStatus != http.StatusOK {
 		http.Error(w, "version unavailable", s.versionStatus)
 		return
@@ -66,6 +73,9 @@ func (s *fakeIPFSServer) handleVersion(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *fakeIPFSServer) handleAdd(w http.ResponseWriter, r *http.Request) {
+	if s.addDelay > 0 {
+		time.Sleep(s.addDelay)
+	}
 	if s.addStatus != http.StatusOK {
 		http.Error(w, "add unavailable", s.addStatus)
 		return
@@ -102,6 +112,9 @@ func (s *fakeIPFSServer) handleAdd(w http.ResponseWriter, r *http.Request) {
 
 func (s *fakeIPFSServer) handleCat(w http.ResponseWriter, r *http.Request) {
 	arg := r.URL.Query().Get("arg")
+	if delay, ok := s.catDelay[arg]; ok && delay > 0 {
+		time.Sleep(delay)
+	}
 	if status, ok := s.catStatus[arg]; ok {
 		http.Error(w, "cat unavailable", status)
 		return
@@ -413,6 +426,64 @@ func TestVirtualFilePresenceReportsIPFSHealth(t *testing.T) {
 	}
 	if presence.IPFSContentAddressableHealth.Backend != "ipfsCAS" || presence.IPFSContentAddressableHealth.Healthy || !presence.IPFSContentAddressableHealth.Configured {
 		t.Fatalf("unexpected IPFS health payload: %+v", presence.IPFSContentAddressableHealth)
+	}
+}
+
+func TestIPFSContentAddressableHealthTimeoutReportsUnhealthy(t *testing.T) {
+	srv := newFakeIPFSServer(t)
+	srv.versionDelay = 1500 * time.Millisecond
+
+	wrapper, _ := newDefaultBasicCfgWrapper(t)
+	enableExperimentalIPFS(t, wrapper, srv.server.URL, true)
+
+	m := setupModel(t, wrapper)
+	defer cleanupModel(m)
+
+	health := currentIPFSCASBackend(t, m).Health(context.Background())
+	if health.Healthy || !health.Configured || health.Reason == "" {
+		t.Fatalf("unexpected timeout health payload: %+v", health)
+	}
+}
+
+func TestFetchVirtualFileFallsBackWhenIPFSRequestTimesOut(t *testing.T) {
+	srv := newFakeIPFSServer(t)
+	wrapper, fcfg := newDefaultBasicCfgWrapper(t)
+	enableExperimentalIPFS(t, wrapper, srv.server.URL, true)
+
+	m, fc := setupModelWithConnectionFromWrapper(t, wrapper)
+	defer cleanupModel(m)
+
+	data := []byte("remote after ipfs timeout")
+	fc.addFile("ipfstimeout.txt", 0o644, protocol.FileInfoTypeFile, data)
+	file := fc.files[0]
+	if err := m.sdb.Update(fcfg.ID, device1, []protocol.FileInfo{prepareFileInfoForIndex(file)}); err != nil {
+		t.Fatal(err)
+	}
+
+	ipfs := currentIPFSCASBackend(t, m)
+	ref := contentAddressableReferenceForBytes(data)
+	storedRef, err := ipfs.Put(context.Background(), ref, bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ipfs.AssociateFile(fcfg, file, storedRef); err != nil {
+		t.Fatal(err)
+	}
+	srv.catDelay[storedRef.Locator] = 1500 * time.Millisecond
+
+	if _, err := m.SetMetadataOnly(fcfg.ID, file.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeRequests := fc.RequestCallCount()
+	if _, err := m.FetchVirtualFile(context.Background(), fcfg.ID, file.Name); err != nil {
+		t.Fatal(err)
+	}
+	if fc.RequestCallCount() <= beforeRequests {
+		t.Fatal("expected remote fallback after IPFS timeout")
+	}
+	if health := ipfs.Health(context.Background()); health.Healthy || health.Reason == "" {
+		t.Fatalf("expected degraded IPFS health after timeout, got %+v", health)
 	}
 }
 

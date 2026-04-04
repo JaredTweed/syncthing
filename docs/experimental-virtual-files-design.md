@@ -242,12 +242,17 @@ Phase 5 extension: optional IPFS adapter
 - Failure and fallback behavior:
   - IPFS health only influences the optional acceleration path
   - if IPFS is disabled, unhealthy, unreachable, slow, or returns corrupt data, the feature falls back to local CAS or normal remote fetch
+  - transport and timeout failures now update cached IPFS health immediately so debug presence and later fetch attempts reflect live daemon loss more quickly than the normal periodic probe interval
   - IPFS never widens publish semantics and never creates an overwrite-capable fallback
 - What is and is not decentralized yet:
   - this does not make Syncthing fully decentralized in the storage layer
   - the local node still owns metadata, safety checks, explicit fetch decisions, and final file adoption
   - IPFS is currently only an optional local content-addressed cache or mirror behind explicit virtual-file fetch
   - the wire protocol between Syncthing peers remains unchanged
+- Real-Kubo validation path:
+  - fake HTTP tests remain the default fast coverage for adapter semantics and timeout behavior
+  - additional integration-tag tests can use a managed local `kubo`/`ipfs` daemon when the binary is installed, or skip cleanly when it is absent
+  - the real-daemon suite is intended to catch behavioral differences between the fake API assumptions and an actual Kubo node without making IPFS a hard build or runtime dependency
 
 ## Hardening Notes
 
