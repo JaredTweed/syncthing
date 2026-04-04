@@ -253,6 +253,10 @@ Phase 5 extension: optional IPFS adapter
   - fake HTTP tests remain the default fast coverage for adapter semantics and timeout behavior
   - additional integration-tag tests can use a managed local `kubo`/`ipfs` daemon when the binary is installed, or skip cleanly when it is absent
   - the real-daemon suite is intended to catch behavioral differences between the fake API assumptions and an actual Kubo node without making IPFS a hard build or runtime dependency
+  - binary-level live coverage now has a separate integration suite under `./test` that launches two Syncthing binaries plus one real Kubo daemon
+  - the binary suite uses `STTESTBINARY` for the Syncthing binary, `STTESTIPFSAPI` to target an already-running Kubo API, or `STTESTKUBO` / `kubo` / `ipfs` to launch a managed daemon automatically
+  - example command:
+    - `STTESTBINARY=/abs/path/to/syncthing go test -tags integration ./test -run 'TestExperimentalVirtualFilesBinaryIPFS' -count=1`
 
 ## Hardening Notes
 

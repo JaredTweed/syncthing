@@ -48,6 +48,11 @@ type virtualFileNode struct {
 	peerPort     int
 	experimental bool
 	pullerDelay  float64
+	ipfsEnabled  bool
+	ipfsAPIURL   string
+	ipfsPrefer   bool
+	ipfsTimeoutS int
+	ipfsHealthS  int
 
 	proc *rc.Process
 }
@@ -220,6 +225,20 @@ func newVirtualFileNode(t *testing.T, baseDir, name, certFixture string, myID, p
 		peerID:       peerID,
 		experimental: experimental,
 		pullerDelay:  pullerDelay,
+		ipfsTimeoutS: 1,
+		ipfsHealthS:  1,
+	}
+}
+
+func enableNodeIPFS(n *virtualFileNode, apiURL string, prefer bool) {
+	n.ipfsEnabled = true
+	n.ipfsAPIURL = apiURL
+	n.ipfsPrefer = prefer
+	if n.ipfsTimeoutS < 1 {
+		n.ipfsTimeoutS = 1
+	}
+	if n.ipfsHealthS < 1 {
+		n.ipfsHealthS = 1
 	}
 }
 
@@ -328,6 +347,11 @@ func writeNodeConfig(t *testing.T, n *virtualFileNode) {
 	cfg.Options.KeepTemporariesH = 1
 	cfg.Options.ProgressUpdateIntervalS = 1
 	cfg.Options.ExperimentalVirtualFiles = n.experimental
+	cfg.Options.ExperimentalVirtualFilesIPFSEnabled = n.experimental && n.ipfsEnabled
+	cfg.Options.ExperimentalVirtualFilesIPFSAPIURL = n.ipfsAPIURL
+	cfg.Options.ExperimentalVirtualFilesIPFSTimeoutS = n.ipfsTimeoutS
+	cfg.Options.ExperimentalVirtualFilesIPFSHealthIntervalS = n.ipfsHealthS
+	cfg.Options.ExperimentalVirtualFilesIPFSPrefer = n.ipfsPrefer
 	cfg.Options.CREnabled = false
 	cfg.Options.AuditEnabled = false
 
@@ -464,6 +488,26 @@ func awaitVirtualFileState(t *testing.T, n *virtualFileNode, file string, state 
 		}
 		return nil
 	})
+}
+
+func awaitVirtualFileIPFSHealth(t *testing.T, n *virtualFileNode, file string, healthy bool) model.FilePresence {
+	t.Helper()
+	var last model.FilePresence
+	awaitCondition(t, virtualFilesTimeout, "virtual file ipfs health", func() error {
+		presence, status, err := n.proc.VirtualFilePresence(virtualFilesFolderID, file)
+		if err != nil {
+			return err
+		}
+		if status != http.StatusOK {
+			return fmt.Errorf("unexpected status %d", status)
+		}
+		last = presence
+		if presence.IPFSContentAddressableHealth.Healthy != healthy {
+			return fmt.Errorf("healthy=%v reason=%q", presence.IPFSContentAddressableHealth.Healthy, presence.IPFSContentAddressableHealth.Reason)
+		}
+		return nil
+	})
+	return last
 }
 
 func awaitVirtualFileMissing(t *testing.T, n *virtualFileNode, file string) {
@@ -617,6 +661,19 @@ func assertCASObjectExists(t *testing.T, n *virtualFileNode, data []byte) {
 		}
 		return nil
 	})
+}
+
+func peerOutBytes(t *testing.T, n *virtualFileNode, peerID protocol.DeviceID) int64 {
+	t.Helper()
+	conns, err := n.proc.Connections()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, ok := conns[peerID.String()]
+	if !ok {
+		t.Fatalf("peer %s not present in connection stats", peerID)
+	}
+	return stats.OutBytesTotal
 }
 
 func writeNodeFile(t *testing.T, n *virtualFileNode, name string, data []byte) {
