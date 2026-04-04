@@ -43,9 +43,19 @@ var (
 // ContentAddressableReference describes a future content-addressed object
 // without coupling Syncthing to any specific backend implementation.
 type ContentAddressableReference struct {
-	Scheme string `json:"scheme"`
-	Key    string `json:"key"`
-	Size   int64  `json:"size"`
+	Scheme  string `json:"scheme"`
+	Key     string `json:"key"`
+	Size    int64  `json:"size"`
+	Backend string `json:"backend,omitempty"`
+	Locator string `json:"locator,omitempty"`
+}
+
+type ContentAddressableBackendHealth struct {
+	Backend    string    `json:"backend"`
+	Configured bool      `json:"configured"`
+	Healthy    bool      `json:"healthy"`
+	Reason     string    `json:"reason,omitempty"`
+	Checked    time.Time `json:"checked,omitempty"`
 }
 
 // ContentAddressableBackend is the Phase 5 seam for future object stores such
@@ -53,11 +63,12 @@ type ContentAddressableReference struct {
 type ContentAddressableBackend interface {
 	BackendType() string
 	SupportsContentAddressing() bool
+	Health(ctx context.Context) ContentAddressableBackendHealth
 	ReferenceForFile(folder config.FolderConfiguration, file protocol.FileInfo) (ContentAddressableReference, bool, error)
 	AssociateFile(folder config.FolderConfiguration, file protocol.FileInfo, ref ContentAddressableReference) error
 	ForgetFile(folder, file string) error
 	Get(ctx context.Context, ref ContentAddressableReference) (io.ReadCloser, error)
-	Put(ctx context.Context, ref ContentAddressableReference, src io.Reader) error
+	Put(ctx context.Context, ref ContentAddressableReference, src io.Reader) (ContentAddressableReference, error)
 }
 
 type noopContentAddressableBackend struct{}
@@ -130,6 +141,16 @@ func (noopContentAddressableBackend) SupportsContentAddressing() bool {
 	return false
 }
 
+func (noopContentAddressableBackend) Health(context.Context) ContentAddressableBackendHealth {
+	return ContentAddressableBackendHealth{
+		Backend:    "localNoop",
+		Configured: false,
+		Healthy:    false,
+		Reason:     "disabled",
+		Checked:    time.Now().UTC(),
+	}
+}
+
 func (noopContentAddressableBackend) ReferenceForFile(config.FolderConfiguration, protocol.FileInfo) (ContentAddressableReference, bool, error) {
 	return ContentAddressableReference{}, false, nil
 }
@@ -146,8 +167,8 @@ func (noopContentAddressableBackend) Get(context.Context, ContentAddressableRefe
 	return nil, ErrContentAddressableBackendUnavailable
 }
 
-func (noopContentAddressableBackend) Put(context.Context, ContentAddressableReference, io.Reader) error {
-	return ErrContentAddressableBackendUnavailable
+func (noopContentAddressableBackend) Put(context.Context, ContentAddressableReference, io.Reader) (ContentAddressableReference, error) {
+	return ContentAddressableReference{}, ErrContentAddressableBackendUnavailable
 }
 
 func (*localContentAddressableBackend) BackendType() string {
@@ -158,11 +179,25 @@ func (*localContentAddressableBackend) SupportsContentAddressing() bool {
 	return true
 }
 
+func (b *localContentAddressableBackend) Health(context.Context) ContentAddressableBackendHealth {
+	status := ContentAddressableBackendHealth{
+		Backend:    b.BackendType(),
+		Configured: b != nil && b.root != "",
+		Healthy:    b != nil && b.root != "",
+		Checked:    time.Now().UTC(),
+	}
+	if !status.Healthy {
+		status.Reason = "local CAS root unavailable"
+	}
+	return status
+}
+
 func (b *localContentAddressableBackend) ReferenceForFile(folder config.FolderConfiguration, file protocol.FileInfo) (ContentAddressableReference, bool, error) {
 	record, ok, err := b.fileRefRecord(folder.ID, file.Name)
 	if err != nil || !ok {
 		return ContentAddressableReference{}, false, err
 	}
+	record.Ref = normalizeContentAddressableReference(record.Ref)
 	if !record.matches(file) {
 		if err := b.ForgetFile(folder.ID, file.Name); err != nil {
 			return ContentAddressableReference{}, false, err
@@ -189,6 +224,7 @@ func (b *localContentAddressableBackend) ReferenceForFile(folder config.FolderCo
 }
 
 func (b *localContentAddressableBackend) AssociateFile(folder config.FolderConfiguration, file protocol.FileInfo, ref ContentAddressableReference) error {
+	ref = normalizeContentAddressableReference(ref)
 	if err := validateContentAddressableReference(ref); err != nil {
 		return err
 	}
@@ -241,6 +277,10 @@ func (b *localContentAddressableBackend) ForgetFile(folder, file string) error {
 }
 
 func (b *localContentAddressableBackend) Get(_ context.Context, ref ContentAddressableReference) (io.ReadCloser, error) {
+	ref = normalizeContentAddressableReference(ref)
+	if ref.Backend != "" && ref.Backend != b.BackendType() {
+		return nil, ErrContentAddressableReferenceInvalid
+	}
 	if err := validateContentAddressableReference(ref); err != nil {
 		return nil, err
 	}
@@ -271,38 +311,41 @@ func (b *localContentAddressableBackend) Get(_ context.Context, ref ContentAddre
 	}, nil
 }
 
-func (b *localContentAddressableBackend) Put(ctx context.Context, ref ContentAddressableReference, src io.Reader) (err error) {
+func (b *localContentAddressableBackend) Put(ctx context.Context, ref ContentAddressableReference, src io.Reader) (_ ContentAddressableReference, err error) {
+	ref = normalizeContentAddressableReference(ref)
+	ref.Backend = b.BackendType()
+	ref.Locator = ""
 	if err := validateContentAddressableReference(ref); err != nil {
-		return err
+		return ContentAddressableReference{}, err
 	}
 
 	b.mut.Lock()
 	defer b.mut.Unlock()
 
 	if err := b.ensureRoot(); err != nil {
-		return err
+		return ContentAddressableReference{}, err
 	}
 
 	finalPath := b.objectPath(ref)
 	if err := b.ensureExistingObject(ref); err == nil {
-		return b.ensureObjectMeta(ref)
+		return ref, b.ensureObjectMeta(ref)
 	} else if !errors.Is(err, ErrContentAddressableObjectMissing) {
 		if !errors.Is(err, ErrContentAddressableCorrupt) {
-			return err
+			return ContentAddressableReference{}, err
 		}
 		if removeErr := os.Remove(finalPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			return removeErr
+			return ContentAddressableReference{}, removeErr
 		}
 	}
 
 	dir := filepath.Dir(finalPath)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
+		return ContentAddressableReference{}, err
 	}
 
 	tmp, err := os.CreateTemp(dir, "."+ref.Key+".tmp-*")
 	if err != nil {
-		return err
+		return ContentAddressableReference{}, err
 	}
 	tmpName := tmp.Name()
 	defer func() {
@@ -315,33 +358,33 @@ func (b *localContentAddressableBackend) Put(ctx context.Context, ref ContentAdd
 	written, err := copyWithContext(ctx, io.MultiWriter(tmp, hasher), src)
 	if err != nil {
 		_ = tmp.Close()
-		return err
+		return ContentAddressableReference{}, err
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
-		return err
+		return ContentAddressableReference{}, err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return ContentAddressableReference{}, err
 	}
 
 	if written != ref.Size || hex.EncodeToString(hasher.Sum(nil)) != ref.Key {
-		return ErrContentAddressableDigestMismatch
+		return ContentAddressableReference{}, ErrContentAddressableDigestMismatch
 	}
 
 	if err := os.Link(tmpName, finalPath); err != nil {
 		if !errors.Is(err, os.ErrExist) {
-			return err
+			return ContentAddressableReference{}, err
 		}
 		if err := b.ensureExistingObject(ref); err != nil {
-			return err
+			return ContentAddressableReference{}, err
 		}
 	}
 
 	if err := syncDir(dir); err != nil {
-		return err
+		return ContentAddressableReference{}, err
 	}
-	return b.ensureObjectMeta(ref)
+	return ref, b.ensureObjectMeta(ref)
 }
 
 func (r contentAddressableFileRefRecord) matches(file protocol.FileInfo) bool {
@@ -502,8 +545,17 @@ func validateContentAddressableReference(ref ContentAddressableReference) error 
 	return nil
 }
 
+func normalizeContentAddressableReference(ref ContentAddressableReference) ContentAddressableReference {
+	if ref.Backend == "" && ref.Locator == "" {
+		ref.Backend = "localCAS"
+	}
+	return ref
+}
+
 func contentAddressableReferenceEqual(a, b ContentAddressableReference) bool {
-	return a.Scheme == b.Scheme && a.Key == b.Key && a.Size == b.Size
+	a = normalizeContentAddressableReference(a)
+	b = normalizeContentAddressableReference(b)
+	return a.Scheme == b.Scheme && a.Key == b.Key && a.Size == b.Size && a.Backend == b.Backend && a.Locator == b.Locator
 }
 
 func fileBlocksHash(file protocol.FileInfo) []byte {

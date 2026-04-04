@@ -466,7 +466,7 @@ func TestLocalContentAddressableBackendPutGet(t *testing.T) {
 	data := []byte("local cas object payload")
 	ref := contentAddressableReferenceForBytes(data)
 
-	if err := cas.Put(context.Background(), ref, bytes.NewReader(data)); err != nil {
+	if _, err := cas.Put(context.Background(), ref, bytes.NewReader(data)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -499,7 +499,7 @@ func TestLocalContentAddressableBackendDigestMismatchFails(t *testing.T) {
 	defer cleanupModel(m)
 
 	ref := contentAddressableReferenceForBytes([]byte("expected bytes"))
-	if err := currentLocalCASBackend(t, m).Put(context.Background(), ref, bytes.NewReader([]byte("different"))); !errors.Is(err, ErrContentAddressableDigestMismatch) {
+	if _, err := currentLocalCASBackend(t, m).Put(context.Background(), ref, bytes.NewReader([]byte("different"))); !errors.Is(err, ErrContentAddressableDigestMismatch) {
 		t.Fatalf("expected digest mismatch, got %v", err)
 	}
 }
@@ -526,7 +526,7 @@ func TestSetMetadataOnlyReferencesExistingLocalCASContent(t *testing.T) {
 
 	cas := currentLocalCASBackend(t, m)
 	ref := contentAddressableReferenceForBytes(data)
-	if err := cas.Put(context.Background(), ref, bytes.NewReader(data)); err != nil {
+	if _, err := cas.Put(context.Background(), ref, bytes.NewReader(data)); err != nil {
 		t.Fatal(err)
 	}
 	if err := cas.AssociateFile(fcfg, file, ref); err != nil {
@@ -571,7 +571,7 @@ func TestFetchVirtualFileUsesExistingCASContentWithoutRedownload(t *testing.T) {
 
 	cas := currentLocalCASBackend(t, m)
 	ref := contentAddressableReferenceForBytes(data)
-	if err := cas.Put(context.Background(), ref, bytes.NewReader(data)); err != nil {
+	if _, err := cas.Put(context.Background(), ref, bytes.NewReader(data)); err != nil {
 		t.Fatal(err)
 	}
 	if err := cas.AssociateFile(fcfg, file, ref); err != nil {
@@ -634,7 +634,7 @@ func TestFetchVirtualFileFallsBackWhenCASObjectMissing(t *testing.T) {
 
 	cas := currentLocalCASBackend(t, m)
 	ref := contentAddressableReferenceForBytes(data)
-	if err := cas.Put(context.Background(), ref, bytes.NewReader(data)); err != nil {
+	if _, err := cas.Put(context.Background(), ref, bytes.NewReader(data)); err != nil {
 		t.Fatal(err)
 	}
 	if err := cas.AssociateFile(fcfg, file, ref); err != nil {
@@ -687,7 +687,7 @@ func TestFetchVirtualFileFallsBackWhenCASObjectCorrupt(t *testing.T) {
 
 	cas := currentLocalCASBackend(t, m)
 	ref := contentAddressableReferenceForBytes(data)
-	if err := cas.Put(context.Background(), ref, bytes.NewReader(data)); err != nil {
+	if _, err := cas.Put(context.Background(), ref, bytes.NewReader(data)); err != nil {
 		t.Fatal(err)
 	}
 	if err := cas.AssociateFile(fcfg, file, ref); err != nil {
@@ -750,7 +750,7 @@ func TestVirtualFileContentAddressableStatePersistsAcrossRestart(t *testing.T) {
 
 	cas := currentLocalCASBackend(t, m)
 	ref := contentAddressableReferenceForBytes(data)
-	if err := cas.Put(context.Background(), ref, bytes.NewReader(data)); err != nil {
+	if _, err := cas.Put(context.Background(), ref, bytes.NewReader(data)); err != nil {
 		t.Fatal(err)
 	}
 	if err := cas.AssociateFile(fcfg, file, ref); err != nil {

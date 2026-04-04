@@ -1009,13 +1009,15 @@ func (s *service) getDebugVirtualFile(w http.ResponseWriter, r *http.Request) {
 		}
 
 		sendJSON(w, map[string]interface{}{
-			"folder":                    presence.Folder,
-			"file":                      presence.File,
-			"state":                     presence.State,
-			"backend":                   presence.Backend,
-			"contentAddressableBackend": presence.ContentAddressableBackend,
-			"contentAddressableEnabled": presence.ContentAddressableEnabled,
-			"experimentalVirtualFiles":  opts.ExperimentalVirtualFiles,
+			"folder":                       presence.Folder,
+			"file":                         presence.File,
+			"state":                        presence.State,
+			"backend":                      presence.Backend,
+			"contentAddressableBackend":    presence.ContentAddressableBackend,
+			"contentAddressableEnabled":    presence.ContentAddressableEnabled,
+			"contentAddressableHealth":     presence.ContentAddressableHealth,
+			"ipfsContentAddressableHealth": presence.IPFSContentAddressableHealth,
+			"experimentalVirtualFiles":     opts.ExperimentalVirtualFiles,
 		})
 		return
 	}
@@ -1046,7 +1048,17 @@ func (s *service) getDebugVirtualFile(w http.ResponseWriter, r *http.Request) {
 		"backend":                   "localFilesystem",
 		"contentAddressableBackend": "localNoop",
 		"contentAddressableEnabled": false,
-		"experimentalVirtualFiles":  opts.ExperimentalVirtualFiles,
+		"contentAddressableHealth": model.ContentAddressableBackendHealth{
+			Backend:    "localNoop",
+			Configured: false,
+			Healthy:    false,
+		},
+		"ipfsContentAddressableHealth": model.ContentAddressableBackendHealth{
+			Backend:    "ipfsCAS",
+			Configured: false,
+			Healthy:    false,
+		},
+		"experimentalVirtualFiles": opts.ExperimentalVirtualFiles,
 	})
 }
 
@@ -1088,13 +1100,15 @@ func (s *service) postDebugVirtualFileMetadataOnly(w http.ResponseWriter, r *htt
 	}
 
 	sendJSON(w, map[string]interface{}{
-		"folder":                    presence.Folder,
-		"file":                      presence.File,
-		"state":                     presence.State,
-		"backend":                   presence.Backend,
-		"contentAddressableBackend": presence.ContentAddressableBackend,
-		"contentAddressableEnabled": presence.ContentAddressableEnabled,
-		"experimentalVirtualFiles":  s.cfg.Options().ExperimentalVirtualFiles,
+		"folder":                       presence.Folder,
+		"file":                         presence.File,
+		"state":                        presence.State,
+		"backend":                      presence.Backend,
+		"contentAddressableBackend":    presence.ContentAddressableBackend,
+		"contentAddressableEnabled":    presence.ContentAddressableEnabled,
+		"contentAddressableHealth":     presence.ContentAddressableHealth,
+		"ipfsContentAddressableHealth": presence.IPFSContentAddressableHealth,
+		"experimentalVirtualFiles":     s.cfg.Options().ExperimentalVirtualFiles,
 	})
 }
 
@@ -1140,13 +1154,15 @@ func (s *service) postDebugVirtualFileFetch(w http.ResponseWriter, r *http.Reque
 	}
 
 	sendJSON(w, map[string]interface{}{
-		"folder":                    presence.Folder,
-		"file":                      presence.File,
-		"state":                     presence.State,
-		"backend":                   presence.Backend,
-		"contentAddressableBackend": presence.ContentAddressableBackend,
-		"contentAddressableEnabled": presence.ContentAddressableEnabled,
-		"experimentalVirtualFiles":  s.cfg.Options().ExperimentalVirtualFiles,
+		"folder":                       presence.Folder,
+		"file":                         presence.File,
+		"state":                        presence.State,
+		"backend":                      presence.Backend,
+		"contentAddressableBackend":    presence.ContentAddressableBackend,
+		"contentAddressableEnabled":    presence.ContentAddressableEnabled,
+		"contentAddressableHealth":     presence.ContentAddressableHealth,
+		"ipfsContentAddressableHealth": presence.IPFSContentAddressableHealth,
+		"experimentalVirtualFiles":     s.cfg.Options().ExperimentalVirtualFiles,
 	})
 }
 

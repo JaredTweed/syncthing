@@ -43,12 +43,14 @@ var (
 // experiments. Phase 2 supports MetadataOnly records in the local metadata
 // plane while keeping the OS filesystem untouched.
 type FilePresence struct {
-	Folder                    string        `json:"folder"`
-	File                      string        `json:"file"`
-	State                     PresenceState `json:"state"`
-	Backend                   string        `json:"backend"`
-	ContentAddressableBackend string        `json:"contentAddressableBackend,omitempty"`
-	ContentAddressableEnabled bool          `json:"contentAddressableEnabled"`
+	Folder                       string                          `json:"folder"`
+	File                         string                          `json:"file"`
+	State                        PresenceState                   `json:"state"`
+	Backend                      string                          `json:"backend"`
+	ContentAddressableBackend    string                          `json:"contentAddressableBackend,omitempty"`
+	ContentAddressableEnabled    bool                            `json:"contentAddressableEnabled"`
+	ContentAddressableHealth     ContentAddressableBackendHealth `json:"contentAddressableHealth,omitempty"`
+	IPFSContentAddressableHealth ContentAddressableBackendHealth `json:"ipfsContentAddressableHealth,omitempty"`
 }
 
 // ContentReadRequest is reserved for future backend-routed reads. Phase 1
@@ -78,9 +80,12 @@ type ContentBackend interface {
 }
 
 type localFilesystemContentBackend struct {
-	model   *model
-	casOnce sync.Once
-	cas     ContentAddressableBackend
+	model      *model
+	localOnce  sync.Once
+	localCAS   ContentAddressableBackend
+	ipfsMut    sync.Mutex
+	ipfsConfig string
+	ipfsCAS    ContentAddressableBackend
 }
 
 type virtualFileRecord struct {
@@ -110,22 +115,37 @@ func (*localFilesystemContentBackend) ReadAt(_ context.Context, folder config.Fo
 }
 
 func (b *localFilesystemContentBackend) Materialize(ctx context.Context, m *model, folder config.FolderConfiguration, file protocol.FileInfo) error {
-	casBackend := b.ContentAddressableBackend()
-	if casBackend != nil && casBackend.SupportsContentAddressing() {
-		if ref, ok, err := casBackend.ReferenceForFile(folder, file); err != nil {
+	for _, casBackend := range b.referenceBackends(ctx) {
+		if casBackend == nil || !casBackend.SupportsContentAddressing() {
+			continue
+		}
+		ref, ok, err := casBackend.ReferenceForFile(folder, file)
+		if err != nil {
 			return err
-		} else if ok {
-			if err := m.materializeLocalFileFromContentAddressable(ctx, folder, file, ref); err == nil {
-				return nil
-			} else if !errors.Is(err, ErrContentAddressableObjectMissing) && !errors.Is(err, ErrContentAddressableCorrupt) {
-				return err
-			}
+		}
+		if !ok {
+			continue
+		}
+		if err := m.materializeLocalFileFromContentAddressable(ctx, folder, file, ref); err == nil {
+			return nil
+		} else if errors.Is(err, ErrContentAddressableBackendUnavailable) {
+			continue
+		} else if errors.Is(err, ErrContentAddressableObjectMissing) || errors.Is(err, ErrContentAddressableCorrupt) {
 			if err := casBackend.ForgetFile(folder.ID, file.Name); err != nil {
 				return err
 			}
-			if err := m.updateVirtualFileContentRef(folder.ID, file.Name, nil); err != nil {
-				return err
+			record, recordOK, recordErr := m.virtualFileRecord(folder.ID, file.Name)
+			if recordErr != nil {
+				return recordErr
 			}
+			if recordOK && record.ContentRef != nil && contentAddressableReferenceEqual(*record.ContentRef, ref) {
+				if err := m.updateVirtualFileContentRef(folder.ID, file.Name, nil); err != nil {
+					return err
+				}
+			}
+			continue
+		} else {
+			return err
 		}
 	}
 
@@ -136,13 +156,18 @@ func (b *localFilesystemContentBackend) ContentAddressableBackend() ContentAddre
 	if b == nil || b.model == nil || !b.model.experimentalVirtualFilesEnabled() {
 		return noopContentAddressableBackend{}
 	}
-	b.casOnce.Do(func() {
-		b.cas = newLocalContentAddressableBackend(b.model)
+	if ipfs, ok := b.ipfsContentAddressableBackend(); ok && b.model.cfg.Options().ExperimentalVirtualFilesIPFSPrefer {
+		if health := ipfs.Health(context.Background()); health.Healthy {
+			return ipfs
+		}
+	}
+	b.localOnce.Do(func() {
+		b.localCAS = newLocalContentAddressableBackend(b.model)
 	})
-	if b.cas == nil {
+	if b.localCAS == nil {
 		return noopContentAddressableBackend{}
 	}
-	return b.cas
+	return b.localCAS
 }
 
 func (m *model) experimentalVirtualFilesEnabled() bool {
@@ -174,6 +199,20 @@ func newFilePresence(folder, file string, state PresenceState, backend ContentBa
 	if casBackend != nil {
 		presence.ContentAddressableBackend = casBackend.BackendType()
 		presence.ContentAddressableEnabled = casBackend.SupportsContentAddressing()
+		presence.ContentAddressableHealth = casBackend.Health(context.Background())
+	}
+	if local, ok := backend.(*localFilesystemContentBackend); ok {
+		if ipfs, enabled := local.ipfsContentAddressableBackend(); enabled {
+			presence.IPFSContentAddressableHealth = ipfs.Health(context.Background())
+		} else if local.model != nil && local.model.experimentalVirtualFilesEnabled() {
+			presence.IPFSContentAddressableHealth = ContentAddressableBackendHealth{
+				Backend:    "ipfsCAS",
+				Configured: false,
+				Healthy:    false,
+				Reason:     "disabled",
+				Checked:    time.Now().UTC(),
+			}
+		}
 	}
 	return presence
 }
@@ -475,12 +514,26 @@ func (m *model) SetMetadataOnly(folder, file string) (FilePresence, error) {
 		State:   MetadataOnly,
 		Updated: time.Now().UTC(),
 	}
-	casBackend := m.currentContentBackend().ContentAddressableBackend()
-	if casBackend != nil && casBackend.SupportsContentAddressing() {
-		if ref, ok, err := casBackend.ReferenceForFile(cfg, global); err != nil {
-			return FilePresence{}, err
-		} else if ok {
-			record.ContentRef = &ref
+	if backend, ok := m.currentContentBackend().(*localFilesystemContentBackend); ok {
+		for _, casBackend := range backend.referenceBackends(context.Background()) {
+			if casBackend == nil || !casBackend.SupportsContentAddressing() {
+				continue
+			}
+			if ref, ok, err := casBackend.ReferenceForFile(cfg, global); err != nil {
+				return FilePresence{}, err
+			} else if ok {
+				record.ContentRef = &ref
+				break
+			}
+		}
+	} else {
+		casBackend := m.currentContentBackend().ContentAddressableBackend()
+		if casBackend != nil && casBackend.SupportsContentAddressing() {
+			if ref, ok, err := casBackend.ReferenceForFile(cfg, global); err != nil {
+				return FilePresence{}, err
+			} else if ok {
+				record.ContentRef = &ref
+			}
 		}
 	}
 	if err := m.putVirtualFileRecord(folder, name, record); err != nil {

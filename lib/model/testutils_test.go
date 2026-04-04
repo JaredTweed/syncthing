@@ -234,12 +234,35 @@ func currentLocalCASBackend(t testing.TB, m *testModel) *localContentAddressable
 	if backend == nil {
 		t.Fatal("expected content backend")
 	}
-	casBackend := backend.ContentAddressableBackend()
+	localBackend, ok := backend.(*localFilesystemContentBackend)
+	if !ok {
+		t.Fatalf("expected local filesystem content backend, got %T", backend)
+	}
+	casBackend := localBackend.localContentAddressableBackend()
 	cas, ok := casBackend.(*localContentAddressableBackend)
 	if !ok {
 		t.Fatalf("expected local CAS backend, got %T", casBackend)
 	}
 	return cas
+}
+
+func currentIPFSCASBackend(t testing.TB, m *testModel) *ipfsContentAddressableBackend {
+	t.Helper()
+
+	backend := m.currentContentBackend()
+	localBackend, ok := backend.(*localFilesystemContentBackend)
+	if !ok {
+		t.Fatalf("expected local filesystem content backend, got %T", backend)
+	}
+	casBackend, enabled := localBackend.ipfsContentAddressableBackend()
+	if !enabled {
+		t.Fatal("expected IPFS CAS backend to be enabled")
+	}
+	ipfs, ok := casBackend.(*ipfsContentAddressableBackend)
+	if !ok {
+		t.Fatalf("expected IPFS CAS backend, got %T", casBackend)
+	}
+	return ipfs
 }
 
 type alwaysChangedKey struct {

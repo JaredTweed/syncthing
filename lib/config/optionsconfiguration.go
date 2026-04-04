@@ -69,10 +69,17 @@ type OptionsConfiguration struct {
 	// ExperimentalVirtualFiles enables the Phase 1 virtual-files scaffolding.
 	// It is intentionally disabled by default and does not alter standard sync
 	// behavior in this phase.
-	ExperimentalVirtualFiles bool     `json:"experimentalVirtualFiles" xml:"experimentalVirtualFiles" default:"false"`
-	FeatureFlags                []string `json:"featureFlags" xml:"featureFlag"`
-	AuditEnabled                bool     `json:"auditEnabled" xml:"auditEnabled" default:"false" restart:"true"`
-	AuditFile                   string   `json:"auditFile" xml:"auditFile" restart:"true"`
+	ExperimentalVirtualFiles bool `json:"experimentalVirtualFiles" xml:"experimentalVirtualFiles" default:"false"`
+	// ExperimentalVirtualFilesIPFSEnabled enables the optional IPFS-backed CAS
+	// adapter for experimental virtual files. It is disabled by default.
+	ExperimentalVirtualFilesIPFSEnabled         bool     `json:"experimentalVirtualFilesIPFSEnabled" xml:"experimentalVirtualFilesIPFSEnabled" default:"false"`
+	ExperimentalVirtualFilesIPFSAPIURL          string   `json:"experimentalVirtualFilesIPFSAPIURL" xml:"experimentalVirtualFilesIPFSAPIURL" default:"http://127.0.0.1:5001"`
+	ExperimentalVirtualFilesIPFSTimeoutS        int      `json:"experimentalVirtualFilesIPFSTimeoutS" xml:"experimentalVirtualFilesIPFSTimeoutS" default:"5"`
+	ExperimentalVirtualFilesIPFSHealthIntervalS int      `json:"experimentalVirtualFilesIPFSHealthIntervalS" xml:"experimentalVirtualFilesIPFSHealthIntervalS" default:"30"`
+	ExperimentalVirtualFilesIPFSPrefer          bool     `json:"experimentalVirtualFilesIPFSPrefer" xml:"experimentalVirtualFilesIPFSPrefer" default:"false"`
+	FeatureFlags                                []string `json:"featureFlags" xml:"featureFlag"`
+	AuditEnabled                                bool     `json:"auditEnabled" xml:"auditEnabled" default:"false" restart:"true"`
+	AuditFile                                   string   `json:"auditFile" xml:"auditFile" restart:"true"`
 	// The number of connections at which we stop trying to connect to more
 	// devices, zero meaning no limit. Does not affect incoming connections.
 	ConnectionLimitEnough int `json:"connectionLimitEnough" xml:"connectionLimitEnough"`
@@ -142,6 +149,15 @@ func (opts *OptionsConfiguration) prepare(guiPWIsSet bool) {
 	}
 	if opts.ConnectionPriorityTCPWAN <= opts.ConnectionPriorityTCPLAN {
 		opts.ConnectionPriorityTCPWAN = opts.ConnectionPriorityTCPLAN + 1
+	}
+	if opts.ExperimentalVirtualFilesIPFSTimeoutS < 1 {
+		opts.ExperimentalVirtualFilesIPFSTimeoutS = 5
+	}
+	if opts.ExperimentalVirtualFilesIPFSHealthIntervalS < 1 {
+		opts.ExperimentalVirtualFilesIPFSHealthIntervalS = 30
+	}
+	if strings.TrimSpace(opts.ExperimentalVirtualFilesIPFSAPIURL) == "" {
+		opts.ExperimentalVirtualFilesIPFSAPIURL = "http://127.0.0.1:5001"
 	}
 
 	// If usage reporting is enabled we must have a unique ID.

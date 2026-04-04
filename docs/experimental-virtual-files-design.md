@@ -208,6 +208,47 @@ Phase 5 implementation notes:
   - a future non-local adapter should implement the same `ContentAddressableBackend` contract while leaving file-reference validation, placeholder state, and conservative final publish semantics unchanged
 - The debug virtual-file responses expose the current content backend type and the content-addressed backend capability so future adapters can be validated without changing the wire protocol.
 
+Phase 5 extension: optional IPFS adapter
+
+- The current local CAS remains the primary experimental backend.
+- A second optional adapter, `ipfsCAS`, can mirror and reuse content through a local Kubo-compatible HTTP API.
+- New experimental config under `options`:
+  - `experimentalVirtualFilesIPFSEnabled`
+  - `experimentalVirtualFilesIPFSAPIURL`
+  - `experimentalVirtualFilesIPFSTimeoutS`
+  - `experimentalVirtualFilesIPFSHealthIntervalS`
+  - `experimentalVirtualFilesIPFSPrefer`
+- Backend interface adjustments:
+  - content-addressed references now carry backend-specific data (`Backend`, `Locator`) while still using a Syncthing-owned `sha256` key and expected size as the trust anchor
+  - CAS backends report health through `ContentAddressableBackendHealth`
+  - `Put` returns the backend-specific stored reference so adapters like IPFS can attach locators such as a CID
+- IPFS adapter architecture:
+  - `ipfsCAS` is an adapter layer under `lib/model`, not a core sync rewrite
+  - it talks to a configured local HTTP API endpoint and keeps its own file-reference metadata in the Syncthing DB
+  - local CAS and IPFS refs are tracked separately, so IPFS failure cannot invalidate the local CAS baseline
+- Trust model:
+  - IPFS content is always treated as untrusted transport or cache content
+  - every IPFS read is verified locally against the expected full-file `sha256` and size before the materialization path can finish
+  - materialization still runs through the existing staged temp file plus no-overwrite publish semantics
+- Write path:
+  - explicit fetch still downloads or reconstructs bytes locally first
+  - successful explicit fetch stores into local CAS as the primary durable baseline
+  - if IPFS is enabled and healthy, the same verified bytes are mirrored into `ipfsCAS` on a best-effort basis
+  - IPFS mirror failure never invalidates a successful local fetch or local CAS store
+- Read path:
+  - explicit fetch prefers local CAS reuse first
+  - if local CAS has no usable ref, the adapter may reuse a healthy IPFS-backed ref
+  - stale, missing, unhealthy, or corrupt IPFS content is ignored or pruned and fetch falls back safely to local CAS or the normal remote block-fetch path
+- Failure and fallback behavior:
+  - IPFS health only influences the optional acceleration path
+  - if IPFS is disabled, unhealthy, unreachable, slow, or returns corrupt data, the feature falls back to local CAS or normal remote fetch
+  - IPFS never widens publish semantics and never creates an overwrite-capable fallback
+- What is and is not decentralized yet:
+  - this does not make Syncthing fully decentralized in the storage layer
+  - the local node still owns metadata, safety checks, explicit fetch decisions, and final file adoption
+  - IPFS is currently only an optional local content-addressed cache or mirror behind explicit virtual-file fetch
+  - the wire protocol between Syncthing peers remains unchanged
+
 ## Hardening Notes
 
 - Metadata-only records are now self-healing:

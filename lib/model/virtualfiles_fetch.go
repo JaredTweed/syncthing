@@ -164,7 +164,12 @@ func (m *model) materializeLocalFileFromContentAddressable(ctx context.Context, 
 		return ErrVirtualFileFetchUnsupported
 	}
 
-	casBackend := m.currentContentBackend().ContentAddressableBackend()
+	contentBackend := m.currentContentBackend()
+	localBackend, ok := contentBackend.(*localFilesystemContentBackend)
+	if !ok {
+		return ErrContentAddressableBackendUnavailable
+	}
+	casBackend := localBackend.contentAddressableBackendForRef(ref)
 	if casBackend == nil || !casBackend.SupportsContentAddressing() {
 		return ErrContentAddressableBackendUnavailable
 	}
@@ -179,8 +184,9 @@ func (m *model) materializeLocalFileFromContentAddressable(ctx context.Context, 
 }
 
 func (m *model) storeVirtualFileContentInContentAddressable(ctx context.Context, folder config.FolderConfiguration, file protocol.FileInfo, filesystem fs.Filesystem, name string) (*ContentAddressableReference, error) {
-	casBackend := m.currentContentBackend().ContentAddressableBackend()
-	if casBackend == nil || !casBackend.SupportsContentAddressing() {
+	contentBackend := m.currentContentBackend()
+	localBackend, ok := contentBackend.(*localFilesystemContentBackend)
+	if !ok {
 		return nil, nil
 	}
 
@@ -195,16 +201,43 @@ func (m *model) storeVirtualFileContentInContentAddressable(ctx context.Context,
 	}
 	defer fd.Close()
 
-	if err := casBackend.Put(ctx, ref, fd); err != nil {
+	localCAS := localBackend.localContentAddressableBackend()
+	var primaryRef *ContentAddressableReference
+	if localCAS != nil && localCAS.SupportsContentAddressing() {
+		storedRef, err := localCAS.Put(ctx, ref, fd)
+		if err != nil {
+			return nil, err
+		}
+		if err := localCAS.AssociateFile(folder, file, storedRef); err != nil {
+			return nil, err
+		}
+		primaryRef = &storedRef
+	}
+
+	if ipfsCAS, ok := localBackend.ipfsContentAddressableBackend(); ok && ipfsCAS.SupportsContentAddressing() {
+		if health := ipfsCAS.Health(ctx); health.Healthy {
+			ipfsFile, openErr := filesystem.Open(name)
+			if openErr == nil {
+				storedRef, putErr := ipfsCAS.Put(ctx, ref, ipfsFile)
+				_ = ipfsFile.Close()
+				if putErr == nil {
+					if associateErr := ipfsCAS.AssociateFile(folder, file, storedRef); associateErr == nil {
+						if primaryRef == nil {
+							primaryRef = &storedRef
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if primaryRef == nil {
+		return nil, nil
+	}
+	if err := m.updateVirtualFileContentRef(folder.ID, file.Name, primaryRef); err != nil {
 		return nil, err
 	}
-	if err := casBackend.AssociateFile(folder, file, ref); err != nil {
-		return nil, err
-	}
-	if err := m.updateVirtualFileContentRef(folder.ID, file.Name, &ref); err != nil {
-		return nil, err
-	}
-	return &ref, nil
+	return primaryRef, nil
 }
 
 func (m *model) promoteMaterializedVirtualFile(folder config.FolderConfiguration, file protocol.FileInfo) error {

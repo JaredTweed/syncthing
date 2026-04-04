@@ -1154,13 +1154,15 @@ func TestDebugVirtualFilePresenceFullLocal(t *testing.T) {
 	}
 
 	var data struct {
-		Folder                    string `json:"folder"`
-		File                      string `json:"file"`
-		State                     string `json:"state"`
-		Backend                   string `json:"backend"`
-		ContentAddressableBackend string `json:"contentAddressableBackend"`
-		ContentAddressableEnabled bool   `json:"contentAddressableEnabled"`
-		ExperimentalVirtualFiles  bool   `json:"experimentalVirtualFiles"`
+		Folder                       string                                `json:"folder"`
+		File                         string                                `json:"file"`
+		State                        string                                `json:"state"`
+		Backend                      string                                `json:"backend"`
+		ContentAddressableBackend    string                                `json:"contentAddressableBackend"`
+		ContentAddressableEnabled    bool                                  `json:"contentAddressableEnabled"`
+		ContentAddressableHealth     model.ContentAddressableBackendHealth `json:"contentAddressableHealth"`
+		IPFSContentAddressableHealth model.ContentAddressableBackendHealth `json:"ipfsContentAddressableHealth"`
+		ExperimentalVirtualFiles     bool                                  `json:"experimentalVirtualFiles"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		t.Fatal(err)
@@ -1174,6 +1176,12 @@ func TestDebugVirtualFilePresenceFullLocal(t *testing.T) {
 	}
 	if data.ContentAddressableBackend != "localNoop" || data.ContentAddressableEnabled {
 		t.Fatalf("unexpected content-addressed backend payload: %+v", data)
+	}
+	if data.ContentAddressableHealth.Backend != "localNoop" || data.ContentAddressableHealth.Configured || data.ContentAddressableHealth.Healthy {
+		t.Fatalf("unexpected CAS health payload: %+v", data.ContentAddressableHealth)
+	}
+	if data.IPFSContentAddressableHealth.Backend != "ipfsCAS" || data.IPFSContentAddressableHealth.Configured || data.IPFSContentAddressableHealth.Healthy {
+		t.Fatalf("unexpected IPFS health payload: %+v", data.IPFSContentAddressableHealth)
 	}
 	if data.ExperimentalVirtualFiles {
 		t.Fatal("expected experimentalVirtualFiles to be false in response")
@@ -1195,6 +1203,16 @@ func TestDebugVirtualFileMetadataOnlyMutation(t *testing.T) {
 			State:                     model.MetadataOnly,
 			Backend:                   "localFilesystem",
 			ContentAddressableBackend: "localNoop",
+			ContentAddressableHealth: model.ContentAddressableBackendHealth{
+				Backend:    "localNoop",
+				Configured: false,
+				Healthy:    false,
+			},
+			IPFSContentAddressableHealth: model.ContentAddressableBackendHealth{
+				Backend:    "ipfsCAS",
+				Configured: false,
+				Healthy:    false,
+			},
 		},
 	}
 
@@ -1220,10 +1238,12 @@ func TestDebugVirtualFileMetadataOnlyMutation(t *testing.T) {
 	}
 
 	var data struct {
-		State                     string `json:"state"`
-		ContentAddressableBackend string `json:"contentAddressableBackend"`
-		ContentAddressableEnabled bool   `json:"contentAddressableEnabled"`
-		ExperimentalVirtualFiles  bool   `json:"experimentalVirtualFiles"`
+		State                        string                                `json:"state"`
+		ContentAddressableBackend    string                                `json:"contentAddressableBackend"`
+		ContentAddressableEnabled    bool                                  `json:"contentAddressableEnabled"`
+		ContentAddressableHealth     model.ContentAddressableBackendHealth `json:"contentAddressableHealth"`
+		IPFSContentAddressableHealth model.ContentAddressableBackendHealth `json:"ipfsContentAddressableHealth"`
+		ExperimentalVirtualFiles     bool                                  `json:"experimentalVirtualFiles"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		t.Fatal(err)
@@ -1233,6 +1253,9 @@ func TestDebugVirtualFileMetadataOnlyMutation(t *testing.T) {
 	}
 	if data.ContentAddressableBackend != "localNoop" || data.ContentAddressableEnabled {
 		t.Fatalf("unexpected content-addressed backend payload: %+v", data)
+	}
+	if data.ContentAddressableHealth.Backend != "localNoop" || data.IPFSContentAddressableHealth.Backend != "ipfsCAS" {
+		t.Fatalf("unexpected health payload: active=%+v ipfs=%+v", data.ContentAddressableHealth, data.IPFSContentAddressableHealth)
 	}
 	if !data.ExperimentalVirtualFiles {
 		t.Fatal("expected experimentalVirtualFiles to be true in response")
@@ -1288,6 +1311,16 @@ func TestDebugVirtualFileFetch(t *testing.T) {
 			State:                     model.FullLocal,
 			Backend:                   "localFilesystem",
 			ContentAddressableBackend: "localNoop",
+			ContentAddressableHealth: model.ContentAddressableBackendHealth{
+				Backend:    "localNoop",
+				Configured: false,
+				Healthy:    false,
+			},
+			IPFSContentAddressableHealth: model.ContentAddressableBackendHealth{
+				Backend:    "ipfsCAS",
+				Configured: false,
+				Healthy:    false,
+			},
 		},
 	}
 
@@ -1313,10 +1346,12 @@ func TestDebugVirtualFileFetch(t *testing.T) {
 	}
 
 	var data struct {
-		State                     string `json:"state"`
-		ContentAddressableBackend string `json:"contentAddressableBackend"`
-		ContentAddressableEnabled bool   `json:"contentAddressableEnabled"`
-		ExperimentalVirtualFiles  bool   `json:"experimentalVirtualFiles"`
+		State                        string                                `json:"state"`
+		ContentAddressableBackend    string                                `json:"contentAddressableBackend"`
+		ContentAddressableEnabled    bool                                  `json:"contentAddressableEnabled"`
+		ContentAddressableHealth     model.ContentAddressableBackendHealth `json:"contentAddressableHealth"`
+		IPFSContentAddressableHealth model.ContentAddressableBackendHealth `json:"ipfsContentAddressableHealth"`
+		ExperimentalVirtualFiles     bool                                  `json:"experimentalVirtualFiles"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		t.Fatal(err)
@@ -1326,6 +1361,9 @@ func TestDebugVirtualFileFetch(t *testing.T) {
 	}
 	if data.ContentAddressableBackend != "localNoop" || data.ContentAddressableEnabled {
 		t.Fatalf("unexpected content-addressed backend payload: %+v", data)
+	}
+	if data.ContentAddressableHealth.Backend != "localNoop" || data.IPFSContentAddressableHealth.Backend != "ipfsCAS" {
+		t.Fatalf("unexpected health payload: active=%+v ipfs=%+v", data.ContentAddressableHealth, data.IPFSContentAddressableHealth)
 	}
 	if !data.ExperimentalVirtualFiles {
 		t.Fatal("expected experimentalVirtualFiles to be true in response")
